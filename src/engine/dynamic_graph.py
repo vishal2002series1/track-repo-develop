@@ -2,6 +2,7 @@
 import operator
 import os
 import sqlite3
+import json
 from dotenv import load_dotenv
 from typing import Annotated, Sequence, TypedDict
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
@@ -11,7 +12,7 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import BaseModel
 
-# 🟢 AZURE MIGRATION: Swap Bedrock for Azure OpenAI
+# AZURE MIGRATION: Swap Bedrock for Azure OpenAI
 from langchain_openai import AzureChatOpenAI 
 
 from sqlalchemy.orm import Session
@@ -22,7 +23,19 @@ from src.agents.tools import AEON_TOOLS
 # Load environment variables from .env file
 load_dotenv()
 
-# --- 🟢 PERSISTENT STATE MEMORY ---
+# --- PROMPT LIBRARY LOADER ---
+def load_prompt_library():
+    """Dynamically loads global system prompts from the config folder."""
+    # Maps to: src/config/prompt_library.json
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../config/prompt_library.json'))
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Warning: Could not load prompt_library.json: {e}")
+        return {"supervisor_rules": "", "synthesizer_persona": "You are a helpful assistant."}
+
+# --- PERSISTENT STATE MEMORY ---
 # We use SqliteSaver so threads survive server restarts and cross-platform tests
 DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data_local/threads.sqlite'))
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -40,7 +53,7 @@ class AgentState(TypedDict):
 
 # --- 2. LLM Initialization ---
 def get_llm():
-    # 🟢 AZURE MIGRATION: Dynamically pull credentials
+    # AZURE MIGRATION: Dynamically pull credentials
     api_key = os.getenv("API_KEYS")
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     api_version = os.getenv("OPENAI_API_VERSION")
@@ -99,11 +112,12 @@ def create_worker_node(persona: str, tools: list):
 def synthesizer_node(state: AgentState):
     """Formats the final response beautifully for the user."""
     llm = get_llm()
+    prompts = load_prompt_library() # 👈 Load dynamically
     
     clean_history = extract_clean_history(state["messages"])
             
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are the final response synthesizer. Review the conversation history below. Provide a comprehensive, beautifully formatted Markdown response that directly answers the user's latest request."),
+        ("system", prompts.get("synthesizer_persona", "You are a helpful assistant.")),
         ("human", "Here is the conversation history and data:\n\n{history}")
     ])
     
@@ -125,6 +139,8 @@ def build_dynamic_graph(workflow_id: str, db: Session):
     agent_names = [agent.id for agent in agents]
     options = ["synthesizer"] + agent_names
     
+    prompts = load_prompt_library() # 👈 Load dynamically
+    
     system_prompt = (
         "You are the Workflow Supervisor. Your job is to route the conversation to the correct expert agent based on the user's request.\n"
         "Available Agents:\n"
@@ -132,12 +148,8 @@ def build_dynamic_graph(workflow_id: str, db: Session):
     for agent in agents:
         system_prompt += f"- {agent.id}: {agent.routing_description}\n"
         
-    system_prompt += (
-        "\nCRITICAL ROUTING RULES:\n"
-        "1. If the user is asking a follow-up question that can be answered using data ALREADY retrieved in the conversation history, you MUST route to 'synthesizer'.\n"
-        "2. If the user is asking for a summary of the previous response, you MUST route to 'synthesizer'.\n"
-        "3. Only route to an expert agent if NEW data needs to be queried from the database.\n"
-    )
+    # Append the dynamic rules instead of hardcoded strings
+    system_prompt += prompts.get("supervisor_rules", "")
 
     class Route(BaseModel):
         next: str
@@ -155,7 +167,7 @@ def build_dynamic_graph(workflow_id: str, db: Session):
         supervisor_chain = prompt | llm.with_structured_output(Route)
         result = supervisor_chain.invoke({"history": clean_history})
         
-        print(f"👑 [SUPERVISOR] Routing to: {result.next}")
+        print(f"🔗 [SUPERVISOR] Routing to: {result.next}")
         return {"next": result.next}
 
     builder = StateGraph(AgentState)
