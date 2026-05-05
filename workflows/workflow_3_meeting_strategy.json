@@ -1,0 +1,53 @@
+{
+  "workflow_id": "WF_003",
+  "workflow_name": "Meeting Strategy & Next Best Action",
+  "description": "Queries supporting meeting and interaction preparation, such as agenda creation, listing of action items, drafting discovery questions, and identifying the highest-leverage next actions across top households.",
+  "required_data_sources": [
+    "CRMActivities",
+    "TransactionData",
+    "PortfolioData",
+    "FinancialPlanDetails",
+    "BoxFiles",
+    "TaskManagement",
+    "ClientDetails"
+  ],
+  "user_mandatory_agents": [
+    "client_profile_domain_agent"
+  ],
+  "final_resolved_agents": [
+    "client_profile_domain_agent",
+    "portfolio_domain_agent",
+    "crm_activities_domain_agent",
+    "transactions_domain_agent",
+    "financial_plan_domain_agent",
+    "box_files_domain_agent",
+    "task_management_domain_agent"
+  ],
+  "target_questions": [
+    {
+      "id": "Q1",
+      "intent": "Meeting-specific priorities and follow-ups improve outcomes by focusing on the highest-impact issues and ensuring action items are captured and executed.",
+      "prompt": "For each meeting on my calendar this week, what are the top three issues I should address and the most relevant follow-up action?"
+    },
+    {
+      "id": "Q2",
+      "intent": "Surfacing what changed since the last review keeps the discussion relevant, supports timely plan updates, and demonstrates proactive stewardship.",
+      "prompt": "What has changed for this household since our last review that should shape today\u2019s conversation?"
+    },
+    {
+      "id": "Q3",
+      "intent": "A tailored agenda raises meeting efficiency and client confidence by organizing discussion around current issues, portfolio changes, and pending planning gaps.",
+      "prompt": "Draft the best agenda for my next review with the Johnson family based on open planning issues, portfolio changes, and recent conversations."
+    },
+    {
+      "id": "Q4",
+      "intent": "Discovery questions reveal unmet needs and risks; this helps the advisor expand planning scope, personalize advice, and uncover actionable next steps.",
+      "prompt": "What questions should I ask this client to uncover unmet needs or planning risks?"
+    },
+    {
+      "id": "Q5",
+      "intent": "Advisors need prioritization across many households; this identifies the highest-leverage next actions to maximize client outcomes and time efficiency.",
+      "prompt": "What is the most important thing I should do next for each of my top 25 households?"
+    }
+  ]
+}
