@@ -16,4 +16,4 @@ jobs:
         run: |
           curl -X POST "${{ secrets.TEAMS_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
-            -d "{\"message\": \"AEON Development Progress Update: Workflow triggered manually on $(date +'%Y-%m-%d %H:%M:%S') UTC.\"}"
+            -d "{\"task_id\": \"1\"}"
