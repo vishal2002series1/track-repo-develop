@@ -42,8 +42,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           PR_MERGED: ${{ github.event.pull_request.merged }}
           MANUAL_TASK_ID: ${{ inputs.task_id }}
           MANUAL_STATUS: ${{ inputs.status }}
@@ -57,27 +56,27 @@ jobs:
             STATUS="$MANUAL_STATUS"
 
           elif [ "$EVENT" = "create" ]; then
-            # Trigger 2: New branch created — extract [TASK_ID:X] from branch name
+            # Trigger 2: New branch created with format <username>/task-id-<number>
             BRANCH_NAME="${REF#refs/heads/}"
-            TASK_ID=$(echo "$BRANCH_NAME" | grep -oP '(?<=\[TASK_ID:)\d+(?=\])')
+            TASK_ID=$(echo "$BRANCH_NAME" | grep -ioP '(?<=task-id-)\d+')
             STATUS="In Progress"
 
           elif [ "$EVENT" = "pull_request" ]; then
-            # Extract [TASK_ID:X] from PR title or body
-            TASK_ID=$(echo "$PR_TITLE $PR_BODY" | grep -oP '(?<=\[TASK_ID:)\d+(?=\])' | head -1)
+            # Trigger 3 & 4: Extract task ID from the source branch name
+            TASK_ID=$(echo "$PR_BRANCH" | grep -ioP '(?<=task-id-)\d+')
 
             if [ "$PR_MERGED" = "true" ]; then
-              # Trigger 5: PR merged → Completed
+              # Trigger 4: PR merged → Completed
               STATUS="Completed"
             else
-              # Trigger 3/4: PR opened or edited → Under Review
+              # Trigger 3: PR opened/edited → Under Review
               STATUS="Under Review"
             fi
           fi
 
-          # Abort if no task ID was found
+          # Abort if no task ID was found or branch does not match expected format
           if [ -z "$TASK_ID" ]; then
-            echo "No [TASK_ID:] found. Skipping."
+            echo "Branch does not match <username>/task-id-<number> format. Skipping."
             echo "skip=true" >> $GITHUB_OUTPUT
           else
             echo "task_id=$TASK_ID" >> $GITHUB_OUTPUT
