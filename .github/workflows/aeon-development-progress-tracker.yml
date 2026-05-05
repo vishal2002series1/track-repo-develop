@@ -34,6 +34,9 @@ permissions:
 permissions:
   contents: read
 
+permissions:
+  contents: read
+
 jobs:
   track-task:
     runs-on: ubuntu-latest
