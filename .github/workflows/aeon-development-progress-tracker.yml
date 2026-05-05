@@ -3,6 +3,9 @@ name: aeon-development-progress-tracker
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   notify-teams:
     runs-on: ubuntu-latest
