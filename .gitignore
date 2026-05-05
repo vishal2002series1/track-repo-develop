@@ -1,0 +1,12 @@
+# Environments
+venv/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local MVP Data
+data_local/
+*.db
+*.sqlite3

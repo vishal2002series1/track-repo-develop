@@ -1,0 +1,62 @@
+{
+  "workflow_id": "WF_002",
+  "workflow_name": "Portfolio & Performance Analysis",
+  "description": "Enables an advisor to analyze client portfolios, identify concentration risks, track actual performance against target benchmarks, evaluate asset allocation, and discover opportunities for wallet share expansion and tax optimization across their book of business.",
+  "required_data_sources": [
+    "PortfolioData",
+    "ClientDetails",
+    "AdvisorClients",
+    "AdvisorPerformance",
+    "PortfolioSimulator",
+    "NextBestAction",
+    "SmartInsights"
+  ],
+  "user_mandatory_agents": [
+    "client_profile_domain_agent"
+  ],
+  "final_resolved_agents": [
+    "client_profile_domain_agent",
+    "portfolio_domain_agent",
+    "performance_benchmarking_domain_agent",
+    "portfolio_simulator_domain_agent",
+    "smart_insights_domain_agent",
+    "compliance_documents_domain_agent"
+  ],
+  "target_questions": [
+    {
+      "id": "Q1",
+      "intent": "Identify concentration risk and overexposure",
+      "prompt": "List clients who have a high concentration risk in their portfolio, specifically looking for those with overexposure to single equities or high stock allocations relative to their risk profile."
+    },
+    {
+      "id": "Q2",
+      "intent": "Track performance versus target benchmarks",
+      "prompt": "Show me the actual versus target portfolio performance trend for the High Net Worth segment over the last six months."
+    },
+    {
+      "id": "Q3",
+      "intent": "Identify wallet share expansion opportunities",
+      "prompt": "Identify the top 5 clients by managed AUM who have less than 70% wallet share with us and hold significant outside assets, representing a strong consolidation opportunity."
+    },
+    {
+      "id": "Q4",
+      "intent": "Analyze advisor book of business metrics",
+      "prompt": "What is the total AUM and revenue breakdown across different asset segments (Fixed, Stocks, Alts, Cash) for Advisor 1's Mass Affluent book of business?"
+    },
+    {
+      "id": "Q5",
+      "intent": "Review asset allocation alignment",
+      "prompt": "Which clients have a conservative or moderate risk tolerance but are currently holding more than 50% of their portfolio in stocks?"
+    },
+    {
+      "id": "Q6",
+      "intent": "Surface actionable portfolio insights",
+      "prompt": "Are there any smart insights or next best actions specifically related to tax-loss harvesting, tax optimization, or portfolio rebalancing for my clients?"
+    },
+    {
+      "id": "Q7",
+      "intent": "Ad-hoc specific client portfolio retrieval",
+      "prompt": "What is the exact cash and fixed income allocation for Jeremy M. Johnson (Client ID 2), and are there any specific risks or alerts flagged for his account?"
+    }
+  ]
+}
