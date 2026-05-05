@@ -35,6 +35,16 @@ jobs:
   track-task:
     runs-on: ubuntu-latest
     environment: develop
+    # Only run if:
+    # - create event: branch name contains /task-id-
+    # - pull_request event: source branch name contains /task-id-
+    # - workflow_dispatch: always run
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'create' && github.ref_type == 'branch' &&
+        contains(github.ref, '/task-id-')) ||
+      (github.event_name == 'pull_request' &&
+        contains(github.event.pull_request.head.ref, '/task-id-'))
 
     steps:
       - name: Resolve Task ID and Status
