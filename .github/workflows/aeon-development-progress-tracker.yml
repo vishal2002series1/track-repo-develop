@@ -1,19 +1,93 @@
-name: aeon-development-progress-tracker
+name: AEON Project Tracker
 
 on:
+  # Trigger 1: Manual dispatch with Task ID and Status inputs
   workflow_dispatch:
+    inputs:
+      task_id:
+        description: "Task ID"
+        required: true
+        type: string
+      status:
+        description: "Status"
+        required: true
+        type: choice
+        options:
+          - Not Started
+          - In Progress
+          - Under Review
+          - Completed
+
+  # Trigger 2: New branch created (branch push) — detect [TASK_ID:] in branch name
+  create:
+
+  # Trigger 3 & 4 & 5: PR opened, edited, or closed (merged) targeting develop
+  pull_request:
+    types: [opened, edited, closed]
+    branches:
+      - develop
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
-  notify-teams:
+  track-task:
     runs-on: ubuntu-latest
     environment: develop
 
     steps:
-      - name: Post progress update to Teams
+      - name: Resolve Task ID and Status
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          MANUAL_TASK_ID: ${{ inputs.task_id }}
+          MANUAL_STATUS: ${{ inputs.status }}
+        run: |
+          TASK_ID=""
+          STATUS=""
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            # Trigger 1: Manual — use inputs directly
+            TASK_ID="$MANUAL_TASK_ID"
+            STATUS="$MANUAL_STATUS"
+
+          elif [ "$EVENT" = "create" ]; then
+            # Trigger 2: New branch created — extract [TASK_ID:X] from branch name
+            BRANCH_NAME="${REF#refs/heads/}"
+            TASK_ID=$(echo "$BRANCH_NAME" | grep -oP '(?<=\[TASK_ID:)\d+(?=\])')
+            STATUS="In Progress"
+
+          elif [ "$EVENT" = "pull_request" ]; then
+            # Extract [TASK_ID:X] from PR title or body
+            TASK_ID=$(echo "$PR_TITLE $PR_BODY" | grep -oP '(?<=\[TASK_ID:)\d+(?=\])' | head -1)
+
+            if [ "$PR_MERGED" = "true" ]; then
+              # Trigger 5: PR merged → Completed
+              STATUS="Completed"
+            else
+              # Trigger 3/4: PR opened or edited → Under Review
+              STATUS="Under Review"
+            fi
+          fi
+
+          # Abort if no task ID was found
+          if [ -z "$TASK_ID" ]; then
+            echo "No [TASK_ID:] found. Skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "task_id=$TASK_ID" >> $GITHUB_OUTPUT
+            echo "status=$STATUS" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post update to Teams via Power Automate
+        if: steps.resolve.outputs.skip == 'false'
         run: |
           curl -X POST "${{ secrets.TEAMS_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
-            -d "{\"task_id\": \"1\"}"
+            -d "{\"task_id\": \"${{ steps.resolve.outputs.task_id }}\", \"status\": \"${{ steps.resolve.outputs.status }}\"}"
