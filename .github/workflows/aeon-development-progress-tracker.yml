@@ -9,7 +9,7 @@ jobs:
     environment: develop
 
     steps:
-      - name: Post progress update to Teams
+      - name: Step 1: Post progress update to Teams
         run: |
           curl -X POST "${{ secrets.TEAMS_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
