@@ -18,8 +18,13 @@ on:
           - Under Review
           - Completed
 
-  # Trigger 2: New branch created (branch push) — detect [TASK_ID:] in branch name
+  # Trigger 2a: Branch created via GitHub UI/API
   create:
+
+  # Trigger 2b: Branch created by pushing from local git
+  push:
+    branches:
+      - '*/task-id-*'
 
   # Trigger 3 & 4 & 5: PR opened, edited, or closed (merged) targeting develop
   pull_request:
@@ -43,6 +48,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'create' && github.ref_type == 'branch' &&
         contains(github.ref, '/task-id-')) ||
+      (github.event_name == 'push' && github.event.before == '0000000000000000000000000000000000000000' &&
+        contains(github.ref, '/task-id-')) ||
       (github.event_name == 'pull_request' &&
         contains(github.event.pull_request.head.ref, '/task-id-'))
 
@@ -52,6 +59,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           PR_MERGED: ${{ github.event.pull_request.merged }}
           MANUAL_TASK_ID: ${{ inputs.task_id }}
@@ -65,8 +73,8 @@ jobs:
             TASK_ID="$MANUAL_TASK_ID"
             STATUS="$MANUAL_STATUS"
 
-          elif [ "$EVENT" = "create" ]; then
-            # Trigger 2: New branch created with format <username>/task-id-<number>
+          elif [ "$EVENT" = "create" ] || ([ "$EVENT" = "push" ] && [ "$BEFORE" = "0000000000000000000000000000000000000000" ]); then
+            # Trigger 2: New branch created via GitHub UI or pushed from local git
             BRANCH_NAME="${REF#refs/heads/}"
             TASK_ID=$(echo "$BRANCH_NAME" | grep -ioP '(?<=task-id-)\d+')
             STATUS="In Progress"
