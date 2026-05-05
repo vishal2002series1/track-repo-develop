@@ -1,0 +1,16 @@
+name: aeon-development-progress-tracker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  notify-teams:
+    runs-on: ubuntu-latest
+    environment: develop
+
+    steps:
+      - name: Post progress update to Teams
+        run: |
+          curl -X POST "${{ secrets.TEAMS_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"message\": \"AEON Development Progress Update: Workflow triggered manually on $(date +'%Y-%m-%d %H:%M:%S') UTC.\"}"
