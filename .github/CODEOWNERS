@@ -1,0 +1,4 @@
+# CODEOWNERS
+# Owners are defined for all files. Enforce them via branch protection rules on target branches.
+
+* @20230302145_EYGS @20230164689_EYGS @20230152950_EYGS @ey-org/aeon-dev-admins
