@@ -1,9 +1,16 @@
 # src/agents/tools.py
+import asyncio
+import atexit
 import os
 import sys
-import concurrent.futures
-import traceback
+import threading
 from langchain_core.tools import tool
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+
+def _debug(message: str) -> None:
+    print(f"[AEON MCP CLIENT] {message}", file=sys.stderr, flush=True)
 
 # --- 🔍 Robust Path Resolution for MCP Server ---
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
@@ -15,73 +22,154 @@ if os.path.exists(path_option_1):
 else:
     SERVER_SCRIPT_PATH = path_option_2
 
-# --- 🛡️ ISOLATED MCP WORKER (WITH DEBUG TRAPS) ---
-def _mcp_process_worker(tool_name: str, args: dict, server_script_path: str) -> str:
-    """
-    Runs entirely in a separate OS process. 
-    """
-    import asyncio
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
+# --- Persistent MCP Client ---
+class _PersistentMCPClient:
+    """Keeps one FastMCP stdio session alive across repeated tool calls."""
 
-    async def _execute():
-        print(f"\n⏳ [DEBUG WORKER] Starting stdio process for {tool_name}...", flush=True)
+    def __init__(self, server_script_path: str):
+        self.server_script_path = server_script_path
+        self._lock = threading.RLock()
+        self._loop = None
+        self._thread = None
+        self._session = None
+        self._stdio_cm = None
+        self._session_cm = None
+
+    async def _connect(self):
+        if self._session is not None:
+            return
+
+        _debug(f"Starting FastMCP server process: {self.server_script_path}")
+        server_params = StdioServerParameters(
+            command=sys.executable,
+            args=[self.server_script_path],
+        )
+        self._stdio_cm = stdio_client(server_params)
+        read, write = await self._stdio_cm.__aenter__()
+        self._session_cm = ClientSession(read, write)
+        self._session = await self._session_cm.__aenter__()
+        _debug("Initializing MCP session")
+        await self._session.initialize()
+        _debug("MCP session initialized")
+
+    async def _disconnect(self):
+        _debug("Closing MCP session")
+        session_cm = self._session_cm
+        stdio_cm = self._stdio_cm
+        self._session = None
+        self._session_cm = None
+        self._stdio_cm = None
+
+        if session_cm is not None:
+            try:
+                await session_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+        if stdio_cm is not None:
+            try:
+                await stdio_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+    def _ensure_started(self):
+        with self._lock:
+            if self._loop is not None and self._thread is not None and self._thread.is_alive():
+                return
+
+            ready = threading.Event()
+            error_holder = {}
+
+            def _runner():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                self._loop = loop
+                try:
+                    _debug("Starting MCP client event loop")
+                    loop.run_until_complete(self._connect())
+                except Exception as exc:
+                    error_holder["exc"] = exc
+                    _debug(f"MCP client startup failed: {exc}")
+                    ready.set()
+                    return
+                ready.set()
+                loop.run_forever()
+                loop.run_until_complete(self._disconnect())
+                loop.close()
+                _debug("MCP client event loop stopped")
+
+            self._thread = threading.Thread(target=_runner, name="aeon-mcp-client", daemon=True)
+            self._thread.start()
+            ready.wait()
+            if "exc" in error_holder:
+                self._loop = None
+                self._thread = None
+                raise RuntimeError(f"Failed to initialize MCP client: {error_holder['exc']}")
+
+    async def _call_tool(self, tool_name: str, args: dict) -> str:
+        if self._session is None:
+            await self._connect()
+
+        _debug(f"Calling tool '{tool_name}' with args={args}")
+        result = await self._session.call_tool(tool_name, arguments=args)
+        content = getattr(result, "content", None) or []
+        text_chunks = [item.text for item in content if hasattr(item, "text") and item.text]
+        if text_chunks:
+            _debug(f"Tool '{tool_name}' returned {len(text_chunks)} text chunk(s)")
+            return "\n".join(text_chunks)
+        _debug(f"Tool '{tool_name}' returned non-text content")
+        return str(result)
+
+    def call_tool(self, tool_name: str, args: dict, timeout: float = 120.0) -> str:
+        self._ensure_started()
+        future = asyncio.run_coroutine_threadsafe(self._call_tool(tool_name, args), self._loop)
         try:
-            # Added "-u" to force unbuffered output on Windows
-            server_params = StdioServerParameters(
-                command=sys.executable,
-                args=["-u", server_script_path], 
-            )
-            async with stdio_client(server_params) as (read, write):
-                print(f"✅ [DEBUG WORKER] Process spawned. Initializing session...", flush=True)
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    print(f"📡 [DEBUG WORKER] Session initialized! Executing {tool_name}...", flush=True)
-                    
-                    result = await session.call_tool(tool_name, arguments=args)
-                    
-                    print(f"🎉 [DEBUG WORKER] Success! Returning data.", flush=True)
-                    return result.content[0].text
-                    
-        except Exception as e:
-            # Trap the error INSIDE the worker and force print it
-            print(f"\n❌ [CRITICAL WORKER ERROR]: {str(e)}", flush=True)
-            traceback.print_exc()
-            return f"SYSTEM ERROR: The tool failed to execute. Reason: {str(e)}"
+            return future.result(timeout=timeout)
+        except Exception as exc:
+            _debug(f"Tool '{tool_name}' failed on first attempt: {exc}. Reconnecting MCP session.")
+            with self._lock:
+                restart = asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop)
+                restart.result(timeout=5)
+                reconnect = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
+                reconnect.result(timeout=30)
+            future = asyncio.run_coroutine_threadsafe(self._call_tool(tool_name, args), self._loop)
+            return future.result(timeout=timeout)
 
-    return asyncio.run(_execute())
+    def close(self):
+        with self._lock:
+            if self._loop is None:
+                return
+            loop = self._loop
+            thread = self._thread
+            stop_future = asyncio.run_coroutine_threadsafe(self._disconnect(), loop)
+            try:
+                stop_future.result(timeout=5)
+            except Exception:
+                pass
+            loop.call_soon_threadsafe(loop.stop)
+            self._loop = None
+            self._thread = None
+        if thread is not None:
+            thread.join(timeout=2)
+
+
+_MCP_CLIENT = _PersistentMCPClient(SERVER_SCRIPT_PATH)
+atexit.register(_MCP_CLIENT.close)
 
 def run_mcp_tool_sync(tool_name: str, args: dict) -> str:
-    """Safely execute MCP tool by outsourcing it to an isolated process."""
-    print(f"\n🟦 [AGENT ATTEMPTING TOOL CALL] {tool_name} | Args: {args}", flush=True)
-    
-    try:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_mcp_process_worker, tool_name, args, SERVER_SCRIPT_PATH)
-            # Added a 45-second timeout so it cannot hang infinitely
-            return future.result(timeout=45) 
-    except concurrent.futures.TimeoutError:
-        print(f"\n⏰ [TIMEOUT ERROR] Tool {tool_name} hung for more than 45 seconds!", flush=True)
-        return "SYSTEM ERROR: The tool execution timed out."
-    except Exception as e:
-        print(f"\n❌ [EXECUTOR ERROR]: {e}", flush=True)
-        return f"SYSTEM ERROR: Process execution failed. {e}"
-
-# ... keep your existing @tool definitions below this line ...
+    """Execute MCP tools through one long-lived FastMCP stdio session."""
+    _debug(f"Dispatching synchronous tool call for '{tool_name}'")
+    return _MCP_CLIENT.call_tool(tool_name, args)
 
 # --- Pure LangChain Adapters for our MCP Tools ---
-# Agent-> Tool -> Langchain (L1) -> Tool (L2) - > MCP(Repo) (L3) : Tool Call = L1+L2//+L3
 
 @tool
 def execute_sql(query: str) -> str:
     """
     Execute a read-only SQL query against the Aeon Wealth relational database.
     Use this to fetch deterministic client facts, portfolio data, meetings, and compliance flags.
-    Tables available: AIGroupInsight, AdvisorClients, AdvisorCoaching, AdvisorDetails, 
-    AdvisorPerformance, ClientDetails, CollaborationHub, ComplianceHub, Email, EmailInsight, 
-    EmailReply, MarketHighlights, NextBestAction, NextBestActionLandingPag, OpenOpportunities, 
-    PortfolioData, PortfolioSimulator, SmartInsights, SocialListening, Transcript, 
-    TranscriptInsights, TranscriptSummary, UpcomingClientMeetings, chat_memory.
+    Use schema aeon2 (never public) when explicitly qualifying table names.
+    Tables available: AdvisorDetails, AdvisorNotes, ClientActions, ClientDetails, ClientDocuments, Emails, Holdings,
+    MarketHighlights, PortfolioData, Transcripts, and more. Always use get_database_schema tool first to see exact column names and data types before writing SQL queries with this tool.
     """
     return run_mcp_tool_sync("execute_sql", {"query": query})
 

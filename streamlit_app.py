@@ -7,6 +7,48 @@ import pandas as pd
 st.set_page_config(page_title="Aeon Agent Factory", layout="wide")
 API_BASE = "http://127.0.0.1:8000/api"
 
+# --- Playground Presets ---
+PLAYGROUND_EXAMPLE_AGENTS = {
+    "Portfolio Risk Analyst": {
+        "persona": "You are a portfolio risk analyst. Use tools to evaluate concentration, identify single-name risk, and summarize risk mitigation options in concise bullet points.",
+        "tools": ["get_database_schema", "execute_sql", "compute_portfolio_concentration"],
+        "prompt": "For CLI-002, assess portfolio concentration risk, include HHI-style interpretation, and suggest top 3 diversification actions.Also provide personal details",
+    },
+    "Compliance Auditor": {
+        "persona": "You are a strict compliance auditor. Check for missing signatures, stale KYC, and unresolved compliance flags. Report issues by severity and recommend next actions.",
+        "tools": ["get_database_schema", "execute_sql"],
+        "prompt": "Run a compliance review for CLI-002 and list unresolved flags by severity with recommended remediation steps.",
+    },
+    "Client Communications Reviewer": {
+        "persona": "You analyze client communications for sentiment, urgency, and unresolved asks. Use transcript and email search, then provide a short action-focused summary.",
+        "tools": ["search_transcripts", "search_client_emails", "execute_sql"],
+        "prompt": "For CLI-002, analyze recent transcripts and emails for urgency, sentiment, and open requests, then provide follow-up actions.",
+    },
+    "Meeting Prep Assistant": {
+        "persona": "You prepare pre-meeting briefs for advisors. Extract key client context, open action items, and agenda recommendations.",
+        "tools": ["get_database_schema", "execute_sql", "search_transcripts", "search_client_emails"],
+        "prompt": "Prepare a meeting brief for CLI-001 with agenda items, unresolved issues, and recommended talking points.",
+    },
+}
+
+
+def suggest_prompt_from_tools(tools):
+    tool_set = set(tools or [])
+
+    if "compute_portfolio_concentration" in tool_set:
+        return "For client_id 2, evaluate concentration risk and provide practical diversification recommendations."
+
+    if "search_transcripts" in tool_set and "search_client_emails" in tool_set:
+        return "For client_id 2, summarize key concerns from transcripts and emails, then list immediate advisor follow-ups."
+
+    if "execute_sql" in tool_set and "get_database_schema" in tool_set:
+        return "For client_id 2, retrieve the relevant records and provide a concise risk and action summary."
+
+    if "execute_sql" in tool_set:
+        return "Use SQL-backed data to provide a concise status summary for client_id 2 with next best actions."
+
+    return "Ask a question to test persona behavior and tool usage."
+
 # --- HELPER FUNCTIONS ---
 def fetch_data(endpoint):
     try:
@@ -154,14 +196,43 @@ elif page == "Playground":
     st.markdown("Test an agent's persona and tool calling without saving to the DB.")
     
     available_tools = [t["name"] for t in fetch_data("tools")]
+    existing_agents = fetch_data("agents")
+
+    preset_labels = ["Custom (No Preset)"]
+    preset_labels += [f"Example: {name}" for name in PLAYGROUND_EXAMPLE_AGENTS.keys()]
+    if existing_agents:
+        preset_labels += [f"Saved Agent: {a['name']} ({a['id']})" for a in existing_agents]
+
+    selected_preset = st.selectbox("Quick Start Preset", preset_labels)
+
+    default_persona = "You are a helpful assistant. Use tools if necessary."
+    default_tools = []
+    default_test_prompt = "Ask a question..."
+
+    if selected_preset.startswith("Example: "):
+        example_name = selected_preset.replace("Example: ", "", 1)
+        selected_example = PLAYGROUND_EXAMPLE_AGENTS.get(example_name, {})
+        default_persona = selected_example.get("persona", default_persona)
+        default_tools = selected_example.get("tools", [])
+        default_test_prompt = selected_example.get("prompt", default_test_prompt)
+    elif selected_preset.startswith("Saved Agent: "):
+        selected_saved_agent = next(
+            (a for a in existing_agents if selected_preset.endswith(f"({a['id']})")),
+            None
+        )
+        if selected_saved_agent:
+            default_persona = selected_saved_agent.get("persona", default_persona)
+            default_tools = selected_saved_agent.get("authorized_tools", [])
+            default_test_prompt = suggest_prompt_from_tools(default_tools)
     
     col1, col2 = st.columns([1, 1])
     with col1:
-        test_persona = st.text_area("Inject Persona Prompt", height=200, value="You are a helpful assistant. Use tools if necessary.")
-        test_tools = st.multiselect("Give access to tools:", available_tools)
+        test_persona = st.text_area("Inject Persona Prompt", height=200, value=default_persona)
+        valid_default_tools = [t for t in default_tools if t in available_tools]
+        test_tools = st.multiselect("Give access to tools:", available_tools, default=valid_default_tools)
         
     with col2:
-        test_prompt = st.text_area("User Message", height=200, placeholder="Ask a question...")
+        test_prompt = st.text_area("User Message", height=200, value=default_test_prompt, placeholder="Ask a question...")
         if st.button("Run Test", type="primary"):
             with st.spinner("Executing stateless agent..."):
                 payload = {"persona": test_persona, "prompt": test_prompt, "tools": test_tools}

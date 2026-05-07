@@ -8,6 +8,7 @@ pydantic
 mcp
 python-dotenv
 langgraph-checkpoint-sqlite
+psycopg2-binary
 arize
 arize-otel
 openinference-instrumentation-langchain

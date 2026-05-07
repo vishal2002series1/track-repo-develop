@@ -1,9 +1,11 @@
 # main.py
 import uuid
+import sys
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
 from src.db.database import engine, SessionLocal, Base
 from src.db.models import DomainAgent, Workflow
@@ -13,6 +15,12 @@ from src.engine.dynamic_graph import build_dynamic_graph, get_llm, workflow_memo
 from src.agents.tools import AEON_TOOLS
 from langgraph.prebuilt import create_react_agent
 
+
+
+
+def debug_backend(message: str) -> None:
+    print(f"[AEON BACKEND] {message}", file=sys.stderr, flush=True)
+
 # Ensure tables exist
 Base.metadata.create_all(bind=engine)
 
@@ -20,6 +28,15 @@ app = FastAPI(
     title="Aeon Agent Factory API", 
     description="Headless backend for dynamic LangGraph workflows.",
     version="2.0"
+)
+
+# --- CORS Middleware ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this to your frontend's origin in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- Dependency: Database Session ---
@@ -105,10 +122,14 @@ def list_available_tools():
 def test_agent_prompt(request: PlaygroundRequest):
     """Test an agent prompt/persona directly without saving it to the database."""
     try:
+        debug_backend(f"/api/playground called with tools={request.tools}")
         selected_tools = [t for t in AEON_TOOLS if t.name in request.tools]
+        debug_backend(f"Resolved tools for playground: {[t.name for t in selected_tools]}")
         temp_agent = create_react_agent(get_llm(), tools=selected_tools, prompt=request.persona)
         inputs = {"messages": [HumanMessage(content=request.prompt)]}
+        debug_backend("Invoking temporary playground agent")
         result = temp_agent.invoke(inputs)
+        debug_backend("Playground agent completed successfully")
         
         return {
             "status": "success",
@@ -117,6 +138,7 @@ def test_agent_prompt(request: PlaygroundRequest):
             "final_answer": result["messages"][-1].content
         }
     except Exception as e:
+        debug_backend(f"Playground agent failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- 🤖 AGENT CRUD ENDPOINTS ---
@@ -273,8 +295,10 @@ def execute_chat_workflow(request: ChatRequest, db: Session = Depends(get_db)):
     try:
         session_id = request.session_id or str(uuid.uuid4())
         config = {"configurable": {"thread_id": session_id}}
+        debug_backend(f"/api/chat called for workflow_id={request.workflow_id} session_id={session_id}")
         
         graph = build_dynamic_graph(request.workflow_id, db) 
+        debug_backend("Dynamic graph built successfully")
         
         inputs = {"messages": [HumanMessage(content=request.prompt)]}
         trace = []
@@ -286,6 +310,7 @@ def execute_chat_workflow(request: ChatRequest, db: Session = Depends(get_db)):
                 
             for node_name, state_update in event.items():
                 trace.append(node_name)
+                debug_backend(f"Graph emitted node update: {node_name}")
                 
                 if state_update is not None:
                     messages = state_update.get("messages")
@@ -293,6 +318,7 @@ def execute_chat_workflow(request: ChatRequest, db: Session = Depends(get_db)):
                         if hasattr(messages[-1], 'content') and messages[-1].content:
                             final_answer = messages[-1].content
 
+        debug_backend(f"Workflow execution completed with trace={trace}")
         return {
             "workflow_id": request.workflow_id,
             "session_id": session_id,
@@ -301,6 +327,8 @@ def execute_chat_workflow(request: ChatRequest, db: Session = Depends(get_db)):
         }
         
     except ValueError as ve:
+        debug_backend(f"Workflow execution validation error: {ve}")
         raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
+        debug_backend(f"Workflow execution failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

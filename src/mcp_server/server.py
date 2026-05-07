@@ -9,11 +9,22 @@ os.environ["CHROMA_TELEMETRY_IMPL"] = "None"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import sys
-import sqlite3
+import time
+import re
+# import sqlite3  # 🔴 DEPRECATED: SQLite - Replaced with Azure PostgreSQL (kept for reference)
 import chromadb
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 import json
+
+# 🟢 Ensure project root is on sys.path so 'src.*' imports resolve when this
+# script is launched as a subprocess by the MCP client (python server.py).
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+# 🟢 AZURE POSTGRESQL MIGRATION: Import shared connection module
+from src.db.pg_connection import get_pg_connection, AZURE_PG_SCHEMA
 
 # 🟢 LOCAL EMBEDDING MIGRATION: Swap AWS Bedrock for local HuggingFace
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -25,7 +36,7 @@ mcp = FastMCP("AeonWealthMCP")
 # --- Bulletproof Pathing ---
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
 LOCAL_DATA_DIR = os.path.join(BASE_DIR, 'data_local')
-SQLITE_DB_PATH = os.path.join(LOCAL_DATA_DIR, 'aeon_db.sqlite') 
+# SQLITE_DB_PATH = os.path.join(LOCAL_DATA_DIR, 'aeon_db.sqlite')  # 🔴 DEPRECATED: SQLite path (kept for reference)
 CHROMA_DB_PATH = os.path.join(LOCAL_DATA_DIR, 'chroma_db')
 MODEL_PATH = os.path.join(BASE_DIR, 'local_embedding_model')
 
@@ -35,19 +46,37 @@ embedder = HuggingFaceEmbeddings(model_name=MODEL_PATH)
 # ⚡ GLOBAL CACHE STATE
 QUERY_CACHE = {}
 SCHEMA_CACHE = {}
-LAST_DB_MTIME = 0
+# LAST_DB_MTIME = 0  # 🔴 DEPRECATED: SQLite file mtime tracking (kept for reference)
+CACHE_TTL_SECONDS = 300  # 🟢 Cache TTL for PostgreSQL (5 minutes)
+LAST_CACHE_CLEAR = time.time()
 
 def check_cache_invalidation():
-    """Checks file metadata. Wipes cache if DB has been updated."""
-    global LAST_DB_MTIME, QUERY_CACHE, SCHEMA_CACHE
-    try:
-        current_mtime = os.path.getmtime(SQLITE_DB_PATH)
-        if current_mtime != LAST_DB_MTIME:
-            QUERY_CACHE.clear()
-            SCHEMA_CACHE.clear()
-            LAST_DB_MTIME = current_mtime
-    except OSError:
-        pass
+    """Clears cache periodically for PostgreSQL (no file-based mtime check)."""
+    global LAST_CACHE_CLEAR, QUERY_CACHE, SCHEMA_CACHE
+    current_time = time.time()
+    if current_time - LAST_CACHE_CLEAR > CACHE_TTL_SECONDS:
+        QUERY_CACHE.clear()
+        SCHEMA_CACHE.clear()
+        LAST_CACHE_CLEAR = current_time
+    # 🔴 DEPRECATED: SQLite file modification time check (kept for reference)
+    # try:
+    #     current_mtime = os.path.getmtime(SQLITE_DB_PATH)
+    #     if current_mtime != LAST_DB_MTIME:
+    #         QUERY_CACHE.clear()
+    #         SCHEMA_CACHE.clear()
+    #         LAST_DB_MTIME = current_mtime
+    # except OSError:
+    #     pass
+
+
+def _rewrite_to_aeon_schema(query: str) -> str:
+    """Force all SQL schema references to AZURE_PG_SCHEMA (e.g., aeon2)."""
+    updated = query
+    # Rewrite public."Table" -> aeon2."Table"
+    updated = re.sub(r'(?i)\bpublic\s*\.', f'{AZURE_PG_SCHEMA}.', updated)
+    # Rewrite "public"."Table" -> "aeon2"."Table"
+    updated = re.sub(r'(?i)"public"\s*\.', f'"{AZURE_PG_SCHEMA}".', updated)
+    return updated
 
 @mcp.tool()
 def execute_sql(query: str) -> str:
@@ -55,23 +84,41 @@ def execute_sql(query: str) -> str:
     global QUERY_CACHE
     check_cache_invalidation()
 
-    if query in QUERY_CACHE:
-        print(f"\n      ⚡ [CACHE HIT - Instant Return]:\n{query}\n", file=sys.stderr)
-        return QUERY_CACHE[query]
+    normalized_query = _rewrite_to_aeon_schema(query)
 
-    print(f"\n      🟦 [MCP SQL Executing]:\n{query}\n", file=sys.stderr)
+    if normalized_query != query:
+        print(
+            f"\n      🧭 [SCHEMA REWRITE]: replaced 'public' with '{AZURE_PG_SCHEMA}'\n"
+            f"      Original: {query}\n"
+            f"      Rewritten: {normalized_query}\n",
+            file=sys.stderr,
+        )
+
+    if normalized_query in QUERY_CACHE:
+        print(f"\n      ⚡ [CACHE HIT - Instant Return]:\n{normalized_query}\n", file=sys.stderr)
+        return QUERY_CACHE[normalized_query]
+
+    print(f"\n      🟦 [MCP SQL Executing - Azure PostgreSQL]:\n{normalized_query}\n", file=sys.stderr)
     try:
-        if query.strip().upper().startswith(("INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE")):
+        if normalized_query.strip().upper().startswith(("INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE")):
             return "Error: Only SELECT queries are allowed."
 
-        conn = sqlite3.connect(SQLITE_DB_PATH)
+        # 🟢 AZURE POSTGRESQL CONNECTION
+        conn = get_pg_connection()
         cursor = conn.cursor()
-        cursor.execute(query)
-        
+        cursor.execute(normalized_query)
         columns = [description[0] for description in cursor.description]
         rows = cursor.fetchall()
         conn.close()
-        
+
+        # 🔴 DEPRECATED: SQLite connection (kept for reference)
+        # conn = sqlite3.connect(SQLITE_DB_PATH)
+        # cursor = conn.cursor()
+        # cursor.execute(query)
+        # columns = [description[0] for description in cursor.description]
+        # rows = cursor.fetchall()
+        # conn.close()
+
         if not rows:
             res = "No results found."
         else:
@@ -80,7 +127,7 @@ def execute_sql(query: str) -> str:
             for row in rows:
                 res += " | ".join(str(val) if val is not None else "NULL" for val in row) + "\n"
                 
-        QUERY_CACHE[query] = res
+        QUERY_CACHE[normalized_query] = res
         return res
     except Exception as e:
         print(f"\n      ❌ [MCP SQL ERROR]: {str(e)}\n", file=sys.stderr)
@@ -88,7 +135,7 @@ def execute_sql(query: str) -> str:
 
 @mcp.tool()
 def get_database_schema(table_names: list[str] = None) -> str:
-    """Returns the exact CREATE TABLE schemas for the requested tables."""
+    """Returns the column information for requested tables from Azure PostgreSQL."""
     global SCHEMA_CACHE
     check_cache_invalidation()
     
@@ -97,29 +144,70 @@ def get_database_schema(table_names: list[str] = None) -> str:
         print(f"\n      ⚡ [SCHEMA CACHE HIT]: {cache_key}\n", file=sys.stderr)
         return SCHEMA_CACHE[cache_key]
 
-    print(f"\n      🗄️ [FETCHING SCHEMA]: {cache_key}\n", file=sys.stderr)
+    print(f"\n      🗄️ [FETCHING SCHEMA - Azure PostgreSQL]: {cache_key}\n", file=sys.stderr)
     try:
-        conn = sqlite3.connect(SQLITE_DB_PATH)
+        # 🟢 AZURE POSTGRESQL CONNECTION
+        conn = get_pg_connection()
         cursor = conn.cursor()
-        
+
+        # 🟢 PostgreSQL: Use information_schema instead of sqlite_master
         if table_names and len(table_names) > 0:
-            placeholders = ','.join(['?'] * len(table_names))
-            cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name IN ({placeholders})", tuple(table_names))
+            placeholders = ','.join(['%s'] * len(table_names))
+            pg_query = f"""
+                SELECT table_name, column_name, data_type, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name IN ({placeholders})
+                ORDER BY table_name, ordinal_position
+            """
+            cursor.execute(pg_query, (AZURE_PG_SCHEMA, *table_names))
         else:
-            cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
-            
+            cursor.execute("""
+                SELECT table_name, column_name, data_type, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                ORDER BY table_name, ordinal_position
+            """, (AZURE_PG_SCHEMA,))
+
         rows = cursor.fetchall()
         conn.close()
-        
+
+        # 🔴 DEPRECATED: SQLite schema query (kept for reference)
+        # conn = sqlite3.connect(SQLITE_DB_PATH)
+        # cursor = conn.cursor()
+        # if table_names and len(table_names) > 0:
+        #     placeholders = ','.join(['?'] * len(table_names))
+        #     cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name IN ({placeholders})", tuple(table_names))
+        # else:
+        #     cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
+        # rows = cursor.fetchall()
+        # conn.close()
+
         if not rows:
             return "No schema found for the requested tables."
-            
-        res = "--- Database Schema ---\n"
+
+        # 🟢 Format PostgreSQL schema as CREATE TABLE-style output
+        res = "--- Database Schema (Azure PostgreSQL) ---\n"
+        current_table = None
         for row in rows:
-            sql_str = row[1] if len(row) > 1 else row[0]
-            if sql_str:
-                res += sql_str + ";\n\n"
-                
+            table_name, column_name, data_type, is_nullable, column_default = row
+            if table_name != current_table:
+                if current_table is not None:
+                    res += ");\n\n"
+                res += f"CREATE TABLE {table_name} (\n"
+                current_table = table_name
+            nullable = "" if is_nullable == "YES" else " NOT NULL"
+            default = f" DEFAULT {column_default}" if column_default else ""
+            res += f"    {column_name} {data_type.upper()}{nullable}{default},\n"
+        if current_table is not None:
+            res += ");\n\n"
+
+        # 🔴 DEPRECATED: SQLite formatting (kept for reference)
+        # res = "--- Database Schema ---\n"
+        # for row in rows:
+        #     sql_str = row[1] if len(row) > 1 else row[0]
+        #     if sql_str:
+        #         res += sql_str + ";\n\n"
+
         SCHEMA_CACHE[cache_key] = res
         return res
     except Exception as e:
@@ -133,12 +221,20 @@ def compute_portfolio_concentration(client_id: int) -> str:
     check_cache_invalidation()
     
     try:
-        conn = sqlite3.connect(SQLITE_DB_PATH)
+        # 🟢 AZURE POSTGRESQL CONNECTION (uses %s and quoted identifiers for case-sensitivity)
+        conn = get_pg_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT Breakdown FROM PortfolioData WHERE ClientId = ?", (client_id,))
+        cursor.execute('SELECT "Breakdown" FROM "PortfolioData" WHERE "ClientId" = %s', (client_id,))
         row = cursor.fetchone()
         conn.close()
-        
+
+        # 🔴 DEPRECATED: SQLite connection (kept for reference)
+        # conn = sqlite3.connect(SQLITE_DB_PATH)
+        # cursor = conn.cursor()
+        # cursor.execute("SELECT Breakdown FROM PortfolioData WHERE ClientId = ?", (client_id,))
+        # row = cursor.fetchone()
+        # conn.close()
+
         if not row or not row[0]:
             return f"No portfolio breakdown data found for Client {client_id}."
             
@@ -196,5 +292,5 @@ def search_client_emails(client_id: int, query: str) -> str:
         return f"Email Search Error: {str(e)}"
 
 if __name__ == "__main__":
-    print("Starting Aeon Wealth MCP Server...")
+    print("Starting Aeon Wealth MCP Server...", file=sys.stderr)
     mcp.run(transport="stdio")
