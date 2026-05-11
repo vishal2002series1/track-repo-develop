@@ -108,23 +108,7 @@ def create_worker_node(persona: str, tools: list):
         
     return worker_node
 
-# --- NEW: Synthesizer Node ---
-def synthesizer_node(state: AgentState):
-    """Formats the final response beautifully for the user."""
-    llm = get_llm()
-    prompts = load_prompt_library() # 👈 Load dynamically
-    
-    clean_history = extract_clean_history(state["messages"])
-            
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", prompts.get("synthesizer_persona", "You are a helpful assistant.")),
-        ("human", "Here is the conversation history and data:\n\n{history}")
-    ])
-    
-    chain = prompt | llm
-    result = chain.invoke({"history": clean_history})
-    
-    return {"messages": [result]}
+
 
 # --- 4. The Master Compiler ---
 def build_dynamic_graph(workflow_id: str, db: Session):
@@ -140,16 +124,48 @@ def build_dynamic_graph(workflow_id: str, db: Session):
     options = ["synthesizer"] + agent_names
     
     prompts = load_prompt_library() # 👈 Load dynamically
+
+    custom_sup = getattr(workflow, 'supervisor_prompt', None)
+    custom_syn = getattr(workflow, 'synthesizer_prompt', None)
+
+    active_supervisor_rules = custom_sup.strip() if custom_sup and custom_sup.strip() else prompts.get("supervisor_rules", "")
+    active_synthesizer_persona = custom_syn.strip() if custom_syn and custom_syn.strip() else prompts.get("synthesizer_persona", "You are a helpful assistant.")
+
+    # 👈 Fixed: Define agent_descriptions BEFORE using it
+    agent_descriptions = "\n".join([f"- {agent.id}: {agent.routing_description}" for agent in agents])
     
-    system_prompt = (
-        "You are the Workflow Supervisor. Your job is to route the conversation to the correct expert agent based on the user's request.\n"
-        "Available Agents:\n"
-    )
-    for agent in agents:
-        system_prompt += f"- {agent.id}: {agent.routing_description}\n"
+    # 🟢 Modified to use active_supervisor_rules
+    system_prompt = f"""
+    You are the Supervisor orchestrating a team of domain expert agents.
+    
+    YOUR AVAILABLE AGENTS:
+    {agent_descriptions}
+    
+    {active_supervisor_rules}
+    """
+
+    # --- NEW: Synthesizer Node (Moved INSIDE so it can read active_synthesizer_persona) ---
+    def synthesizer_node(state: AgentState):
+        """Formats the final response beautifully for the user."""
+        llm = get_llm()
+        clean_history = extract_clean_history(state["messages"])
+                
+        # 🟢 Modified to use active_synthesizer_persona
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", active_synthesizer_persona),
+            ("human", "Here is the conversation history and data collected so far:\n\n{history}\n\nPlease synthesize the final answer.")
+        ])
+        
+        chain = prompt | llm
+        result = chain.invoke({"history": clean_history})
+        
+        return {"messages": [result]}
+        
+    
+    
         
     # Append the dynamic rules instead of hardcoded strings
-    system_prompt += prompts.get("supervisor_rules", "")
+    system_prompt += active_supervisor_rules
 
     class Route(BaseModel):
         next: str

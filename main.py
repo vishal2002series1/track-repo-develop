@@ -68,6 +68,9 @@ class WorkflowSchema(BaseModel):
     id: str
     name: str
     description: str
+    supervisor_prompt: Optional[str] = None  # <-- Added for it to be  endpoint updatable
+    synthesizer_prompt: Optional[str] = None # <-- Added for it to be  endpoint updatable
+
 
     class Config:
         from_attributes = True
@@ -76,10 +79,16 @@ class WorkflowCreateRequest(BaseModel):
     id: str
     name: str
     description: str
+    supervisor_prompt: Optional[str] = None  # <-- Added for it to be  endpoint updatable
+    synthesizer_prompt: Optional[str] = None # <-- Added for it to be  endpoint updatable
+
 
 class WorkflowUpdateRequest(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    supervisor_prompt: Optional[str] = None  # <-- Added for it to be  endpoint updatable
+    synthesizer_prompt: Optional[str] = None # <-- Added for it to be  endpoint updatable
+
 
 class MapAgentRequest(BaseModel):
     agent_id: str

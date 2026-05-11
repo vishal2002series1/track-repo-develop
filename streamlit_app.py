@@ -68,6 +68,16 @@ def post_data(endpoint, payload):
         st.error(f"Error posting data: {e}")
         return None
 
+#  NEW HELPER: For updating existing workflows
+def put_data(endpoint, payload):
+    try:
+        response = requests.put(f"{API_BASE}/{endpoint}", json=payload)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        st.error(f"Error updating data: {e}")
+        return None
+
 def delete_data(endpoint):
     try:
         response = requests.delete(f"{API_BASE}/{endpoint}")
@@ -152,8 +162,20 @@ elif page == "Workflow Manager":
             wf_id = st.text_input("Workflow ID (e.g., WF_ONBOARDING)")
             wf_name = st.text_input("Workflow Name")
             wf_desc = st.text_input("Description")
+
+            # CUSTOM WORKFLOW PROMPTS ADDITIONS: Optional prompts on creation
+            st.markdown("**(Optional) Override Global Prompts**")
+            wf_sup_prompt = st.text_area("Custom Supervisor Routing Rules", help="Leave blank to use global defaults.")
+            wf_syn_prompt = st.text_area("Custom Synthesizer Persona", help="Leave blank to use global defaults.")
+            
             if st.form_submit_button("Create Workflow"):
-                if post_data("workflows", {"id": wf_id, "name": wf_name, "description": wf_desc}):
+                payload = {"id": wf_id, "name": wf_name, "description": wf_desc}
+                if wf_sup_prompt.strip():
+                    payload["supervisor_prompt"] = wf_sup_prompt.strip()
+                if wf_syn_prompt.strip():
+                    payload["synthesizer_prompt"] = wf_syn_prompt.strip()
+                    
+                if post_data("workflows", payload):
                     st.success("Workflow created!")
                     st.rerun()
 
@@ -176,6 +198,24 @@ elif page == "Workflow Manager":
     for wf in workflows:
         with st.expander(f"⚙️ {wf['name']} ({wf['id']})"):
             st.write(f"**Description:** {wf['description']}")
+
+            # 🟢 EPIC 1 ADDITIONS: Editable Custom Prompts Form
+            with st.form(f"update_prompts_{wf['id']}"):
+                st.markdown("**🧠 Custom Workflow Prompts**")
+                new_sup = st.text_area("Supervisor Routing Rules", value=wf.get("supervisor_prompt", "") or "", height=120)
+                new_syn = st.text_area("Synthesizer Persona", value=wf.get("synthesizer_prompt", "") or "", height=120)
+                
+                if st.form_submit_button("💾 Save Custom Prompts"):
+                    update_payload = {
+                        "supervisor_prompt": new_sup.strip() if new_sup.strip() else None,
+                        "synthesizer_prompt": new_syn.strip() if new_syn.strip() else None
+                    }
+                    if put_data(f"workflows/{wf['id']}", update_payload):
+                        st.success("Prompts updated successfully!")
+                        st.rerun()
+
+            st.write("---")
+            
             wf_agents = fetch_data(f"workflows/{wf['id']}/agents")
             if wf_agents:
                 st.write("**Mapped Agents:**")

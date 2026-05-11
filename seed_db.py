@@ -75,7 +75,10 @@ def seed():
                     new_wf = Workflow(
                         id=wf_id,
                         name=wf_data.get("workflow_name", wf_id),
-                        description=wf_data.get("description", "")
+                        description=wf_data.get("description", ""),
+                        supervisor_prompt=wf_data.get("supervisor_prompt", None),      # 🟢 NEW FOR EPIC 1
+                        synthesizer_prompt=wf_data.get("synthesizer_prompt", None)     # 🟢 NEW FOR EPIC 1
+                        
                     )
                     db.add(new_wf)
                     print(f"   ✅ Added Workflow: {wf_id}")

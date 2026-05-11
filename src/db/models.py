@@ -30,5 +30,10 @@ class Workflow(Base):
     name = Column(String, nullable=False)
     description = Column(Text, nullable=False)
 
+    # Made nullable so we can fallback to global prompt_library.json if empty
+    supervisor_prompt = Column(Text, nullable=True) 
+    synthesizer_prompt = Column(Text, nullable=True)
+
+    
     # Links to agents
     agents = relationship("DomainAgent", secondary=workflow_agent_association, back_populates="workflows")
