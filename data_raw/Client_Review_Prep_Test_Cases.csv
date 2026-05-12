@@ -1,0 +1,146 @@
+﻿Question,Expected Answer
+What are the financial goals on file for Jeremy Johnson?,"Reasoning: Single-entity lookup against one structured column (ClientDetails.FinancialGoals). No retrieval, no joins, no cross-client reasoning. 
+Tests: nlp name -> ClientId resolution + single-table fetch + verbatim quoting (no hallucination).. Expected Answer Shape:  1-line preamble (full name + household). Bulleted list verbatim from FinancialGoals.  . Pass Criteria:   All seed goals present; no hallucinated goals; correct ClientId resolved.Example Output:  Jeremy M. Johnson (Reynolds household) — financial goals on file:
+• Wealth transfer to children and spouse
+• Finding tax efficiencies
+• Retire at 65 with $15M in savings
+"
+Anything major happening in the Wilson household I should be aware of?,"Reasoning: Single-client structured lookup with a possible empty-state. 
+Tests: empty-state handling ('none on record' rather than fabricating) and scope isolation (no leakage of other clients' events).. Expected Answer Shape:  Short paragraph naming client (Jonathan Wilson, divorced, 2 dependents). Bulleted list with date/recency. Empty-state: 'No upcoming life events on record'. . Pass Criteria:   No leakage of other clients' events; 'none' handled cleanly.Example Output:  Jonathan P. Wilson (Divorced, 2 dependents). Upcoming life events on record:
+• Company IPO
+• Daughter's college graduation
+"
+Who's in the Sullivan household and who's the primary contact?,"Reasoning: Single-household lookup but requires JSON parsing of the Household column AND awareness that one HouseholdId can have multiple primary clients (HH-004 = Liz Sullivan + Dwayne Jackson). 
+Tests: structured-field parsing + multi-row aggregation under a single household scope.. Expected Answer Shape:  Bullet list: Name | Relation. Primary contact called out explicitly. . Pass Criteria:   Both CLI-008 (Liz Sullivan) and CLI-015 (Dwayne Jackson) surfaced; JSON parsed correctly; no hallucinated relations.Example Output:  Sullivan household — primary clients:
+• Elizabeth J. Sullivan | Primary contact
+• Dwayne T. Jackson | Primary contact
+• Richard Sullivan | Husband (under Liz)
+• Catherine Sullivan | Daughter (under Liz)
+• James Sullivan | Son (under Liz)
+• Tiana Jackson | Wife (under Dwayne)
+• Evan Jackson | Son (under Dwayne)
+• Zoe Jackson | Daughter (under Dwayne)
+Primary contacts: Elizabeth J. Sullivan AND Dwayne T. Jackson (has two primary clients)."
+Which clients do I have meetings with this week?,"Reasoning: Single-table filter, but introduces session context ('my' = AdvisorId from session) and relative-time resolution ('this week' -> concrete date range). 
+Tests: advisor-scoping and date arithmetic at the agent layer rather than passing the literal string 'this week' into SQL.. Expected Answer Shape:  Table sorted asc by MeetingDay/MeetingTime: Client | Date/time | Meeting type | Trigger. . Pass Criteria:   Only ADV-02(current advisor) clients; meetings inside 7-day window; chronological; explicit empty-state.Example Output:  Upcoming meetings on your calendar (next 7 scheduled):
+• 2026-04-20 — Jeremy M. Johnson — Estate Planning Review
+• 2026-04-20 — Alexander L. Reynolds — Estate Planning Review
+• 2026-04-20 — Carlos A. Mendoza — Business Succession Planning
+• 2026-04-21 — Daniel R. Goldstein — Business Succession Planning
+• 2026-04-21 — Dr. James H. Washington — Retirement Planning
+• 2026-04-21 — Dr. Michelle S. Patel — Investment Strategy Discussion
+• 2026-04-27 — Dwayne T. Jackson — Retirement Planning"
+When did I last talk to Maggie Williams and what was it about?,"Reasoning: Single-client lookup but the 'last interaction' could live in EITHER Transcripts OR Emails - the agent must take MAX(Date) across two tables, not just query one. 
+Tests: cross-source recency reasoning at the simplest level (no synthesis, no semantic search).. Expected Answer Shape:  1 paragraph: date, channel, 1-2 sentence summary.  . Pass Criteria:   Most recent across both tables (not just one); summary grounded in Transcripts.Summary or Emails.Summary, not invented.Example Output:  Last call with Margaret E. Williams: 2025-04-18 — Financial Planning and Asset Management (00:30:10).
+Summary: The call focused on Margaret's priorities, including the launch of her charitable foundation, healthcare planning, and a review of her bond ladder. Evan provided guidance on setting up the foundation with an initial endowment, recommended a supplemental long-term care policy, and
+Sentiment: Positive."
+Summarize the last three advisor notes for the Reynolds household and any pending follow-ups.,"Reasoning: Single household but requires (a) ordering + LIMIT correctly, (b) joining notes with open follow-ups across two tables, and (c) the household-multi-client gotcha (HH-001 contains both CLI-004 and CLI-031). Two domain agents must hand off cleanly to the synthesizer. . Expected Answer Shape:  Per note (x3): date, 1-2 sentence summary, key tags, commitments. Citation AdvisorNote #<id>. Pending follow-ups bullet list. Closing 'What changed / open questions' bullet. . Pass Criteria:   Exactly 3 notes; chronological desc; HH-001 includes BOTH CLI-004 and CLI-031; no cross-household leakage.Example Output:  Reynolds household — last 3 advisor notes:
+• 2026-04-12 —  Asset Recommendation (Neutral). Recommend alternative investments to enhance portfolio diversification
+• 2026-04-07 —  Tax Efficiency (Neutral). Revisit recommendation to structure charitable giving through donor-advised funds (DAFs)
+• 2025-03-30 —  Follow-up notes: Financial Planning and Asset Transfer (Positive). The call focused on Alexander Reynolds' financial planning following a partner buy-out, addressing liquidity management, estate planning updates, and charitable
+Pending follow-ups:
+• [urgent] Tax Efficiency — Revisit recommendation to structure charitable giving through donor-advised funds (DAFs)
+• [short-term] Asset Recommendation — Recommend alternative investments to enhance portfolio diversification
+• [urgent] Review Estate Plan — Ensure estate plan aligns with family goals.
+• [short-term] Set Up DAF — Finalize donor-advised fund setup for tax benefits.
+• [medium-term] Rebalance 529 Plans — Shift twins' 529 plans to conservative allocation."
+"Give me a one-page prep for tomorrow's meeting with Liz Sullivan - recent interactions, open items, and anything notable since the last review.","Reasoning: Single-client but spans 4-5 sources (Transcripts, Emails, AdvisorNotes, ClientActions, PortfolioData) bounded by a per-client time anchor (LastReviewDate). 
+Tests: structured output with multiple required sections + dynamic time-window resolution from a per-client field.. Expected Answer Shape:  5 sections: Meeting header / Key context (3-5 bullets) / Recent interactions / Open tasks / Suggested talking points.  . Pass Criteria:   All 5 sections present (or explicit 'none'); time window >= LastReviewDate; tasks pulled from ClientActions, not invented.Example Output:  Prep packet — Elizabeth J. (""Liz"") Sullivan. Next appt: 2025-08-28.
+Profile: High Net Worth, 52, Washington, DC; investor type Balanced; sentiment Neutral, NPS High, attrition Low.
+Portfolio: AUM $9,250,000, wallet share 84%, outside assets $24,675,000, focus Balanced Growth, risk Moderate (60).
+Recent interactions: last call 2025-05-12 (Financial Planning and Tax Strategy, Positive); last email 2025-09-17 (""Re: Custodial Account Options"", Positive).
+Open items:
+• [short-term] Open 529 Plans — Set up 529 accounts for both children.
+• [urgent] Coordinate Down Payment — Finalize financial actions for second home purchase.
+• [medium-term] Rebalance Portfolio — Adjust portfolio to reduce equities and add bonds.
+• [medium] Retirement Planning — Retirement Planning with Elizabeth J. Sullivan
+• [high] Update Contact Information — Update Contact Information
+Notable since last review (2025-03-01): Elizabeth boosted her 529 savings with a $360,000 Fidelity deposit and saw a $7.5M Bridge Loan SPV gain at Goldman Sachs. Her public equities also grew by 5%, aligning well with her real estate goals."
+Which of my top 10 clients by AUM haven't had a meaningful interaction in the last 90 days?,"Reasoning: Top-N aggregation over the advisor's book with a recency threshold. Requires ranking on PortfolioData.TotalValue, then per-client MAX(date) across 3 tables, then filtering by 90-day delta. 
+Tests: ranking + threshold filtering + 'meaningful interaction' definition consistency.. Expected Answer Shape:  1-line summary + table: Client | AUM | Last interaction date | Days since | Channel. . Pass Criteria:   Rank scoped to ADV-02 only; threshold applied; 'meaningful' = Transcripts OR AdvisorNotes OR inbound Emails (confirm).Example Output:  Top 10 clients by AUM with no meaningful interaction in 90 days (vs 2025-05-13):
+• None — all top-10 clients have a touchpoint within the window."
+"What planning documents do we have on file for the Goldstein household, and when were they last updated?","Reasoning: Single-table fetch but requires the agent to derive a 'stale' flag from ReceivedDate / ExpiryDate vs today (not stored). 
+Tests: agent-side computation of derived state + clean empty-state when no docs exist.. Expected Answer Shape:  Table: DocType | Title | Status | ReceivedDate | ExpiryDate | Source. 'Stale' callout for any doc > 12 months past ReceivedDate or ExpiryDate near today. . Pass Criteria:   Only Goldstein docs; explicit empty-state if none.Example Output:  Goldstein household planning documents on file:
+• Investment Policy Statement (IPS) — received; received 2026-03-21 via box
+• Investment Policy Statement (IPS) — received; received 2026-03-21 via box"
+Pull up the Patel household for me,"Reasoning: Handling ambiguity in intent. Multiple clients match the surface name (""Patel"" → CLI-024 Michelle Patel under ADV-02 vs CLI-028 Priya Patel under ADV-01), and they sit in different households AND different advisors' books. 
+Tests: the agent must detect the ambiguity and ask a clarifying question rather than silently pick one (or worse, merge the two). Also tests advisor-scope awareness — if ""my book"" is honored, the candidate set should narrow to ADV-02's Michelle Patel only, in which case the agent should proceed without asking.. Expected Answer Shape:  Short clarifying response listing the candidates with disambiguating attributes: e.g. ""I see two Patel households on file: Dr. Michelle S. Patel (HH-003, your book) and Priya V. Patel (HH-016, Jane Smith's book). Which one did you mean?"" — no profile data dumped, no silent pick. If advisor-scoping reduces it to one, agent may proceed and state the assumption. . Pass Criteria:   Agent surfaces ≥2 candidates with at least one disambiguating attribute each (HouseholdId, AdvisorId, or first name); does NOT fabricate a merged household; does NOT silently pick one. If only one candidate exists in scope, agent proceeds and explicitly states the assumption.Example Output:  Patel household — 2 primary clients:
+• Dr. Michelle S. Patel — High Net Worth, 45, Cambridge, MA. AUM $15,680,000, wallet share 65%.
+• Dr. James H. Washington — High Net Worth, 58, Boston, MA. AUM $12,485,000, wallet share 84%.
+Last review: 2025-02-28; next review due: 2026-02-23."
+"Compare my top ten clients - their goals, recent conversations, portfolio positioning, documents on file, and any open action items - so I can spot service gaps.","Reasoning: Cross-client comparison requiring 6 of the 9 domain agents to fan out, return raw findings, and the synthesizer to align them into a fixed 10x5 grid. 
+Tests: multi-agent orchestration, parallel data fetch, gap inference from the assembled grid (not from any single source), and resistance to length blow-up. Headline demo question.. Expected Answer Shape:  10-row x 5-column comparison table; cells <=2 lines; 'Service gaps detected' bullets below. . Pass Criteria:   Exactly 10 rows; all 5 dimensions populated or '-'; gaps derived from table not invented; no contradictions across columns.Example Output:  Top 10 client comparison (book):
+• Richard D. Thompson | AUM $68,500,000 | WS 78% | Goals: Business succession; Family foundation scaling | Last call 2025-04-12 (Positive) | Docs 4 | Open tasks 4
+• Sarah J. Elliott | AUM $48,750,000 | WS 80% | Goals: Portfolio diversification; Impact investing expansion | Last call 2025-03-31 (Positive) | Docs 4 | Open tasks 4
+• Katherine L. Davies | AUM $43,250,000 | WS 67% | Goals: Legacy planning; Philanthropy expansion | Last call 2025-03-24 (Positive) | Docs 4 | Open tasks 4
+• Alexander L. Reynolds | AUM $42,500,000 | WS 73% | Goals: Financial independence; Education for children | Last call 2025-03-30 (Positive) | Docs 4 | Open tasks 4
+• Robert J. Martinez | AUM $35,750,000 | WS 69% | Goals: Business succession planning; Minimize estate taxes | Last call 2025-04-16 (Positive) | Docs 4 | Open tasks 4
+• Daniel R. Goldstein | AUM $32,500,000 | WS 73% | Goals: Business succession; Estate planning | Last call 2025-04-18 (Positive) | Docs 4 | Open tasks 4
+• Dwayne T. Jackson | AUM $24,750,000 | WS 80% | Goals: Post-career business ventures; Children's education | Last call 2025-04-02 (Positive) | Docs 4 | Open tasks 4
+• Jonathan P. Wilson | AUM $18,750,000 | WS 79% | Goals: Corporate acquisition; Children's education | Last call 2025-05-07 (Positive) | Docs 4 | Open tasks 4
+• Dr. Michelle S. Patel | AUM $15,680,000 | WS 65% | Goals: Series B funding preparation; Retirement planning | Last call 2025-05-05 (Positive) | Docs 4 | Open tasks 4
+• William J. Harris | AUM $14,250,000 | WS 79% | Goals: Business succession; Retirement at 65 | Last call 2025-03-29 (Positive) | Docs 4 | Open tasks 4
+Service-gap flags: clients with high outside assets vs wallet share <70% AND open compliance items are top consolidation/closure candidates."
+"Across the households I met with last month, which open follow-ups haven't been actioned and which look at risk of slipping?","Reasoning: Sequential reasoning chain: (1) find meetings in window, (2) find follow-ups linked to those meetings, (3) verify each follow-up's status by looking for evidence in Emails/Transcripts AFTER the meeting date. 
+Tests: temporal causality (was the action done AFTER the meeting?) and evidence-based status inference rather than trusting the raw status flag.. Expected Answer Shape:  Two-section split ('Not actioned' / 'At risk'), both as table: Household | Meeting date | Follow-up | Owner | Status | At-risk reason. . Pass Criteria:   'At risk' reasoning grounded in evidence; only households with meetings in window appear.Example Output:  Households met with last month with open/at-risk follow-ups:
+• Alexander L. Reynolds — 4 open; 2 urgent/high. AT RISK: Review Estate Plan, Check for missing documents
+• Carlos A. Mendoza — 4 open; 2 urgent/high. AT RISK: Finalize Trust, Confirm FATCA/CRS Declarations
+• Dr. James H. Washington — 4 open; 1 urgent/high. AT RISK: Review and Update KYC Documentation
+• Dr. Michelle S. Patel — 4 open; 2 urgent/high. AT RISK: Finalize IPO Plan, Respond to compliance request
+• Dwayne T. Jackson — 4 open; 2 urgent/high. AT RISK: Increase Insurance, Verify Identity Document Expiry
+• Elizabeth J. Sullivan — 4 open; 2 urgent/high. AT RISK: Coordinate Down Payment, Update Contact Information
+• Isabella R. Moretti — 4 open; 2 urgent/high. AT RISK: Art Appraisal, Review and Update KYC Documentation
+• Julia M. Santiago — 4 open; 2 urgent/high. AT RISK: Business Insurance, Respond to compliance request
+• Katherine L. Davies — 4 open; 2 urgent/high. AT RISK: Finalize Documents, Update Contact Information
+• Michael T. Nakamura — 4 open; 2 urgent/high. AT RISK: Portfolio Rebalance, Complete Annual AML Questionnaire
+• Samantha K. Johnson — 4 open; 2 urgent/high. AT RISK: Health Insurance Options, Check for Regulatory Filing Deadlines
+• Sarah J. Elliott — 4 open; 2 urgent/high. AT RISK: Rebalance Portfolio, Verify Identity Document Expiry
+• William J. Harris — 4 open; 2 urgent/high. AT RISK: Finalize Succession, Complete Annual AML Questionnaire
+• Richard D. Thompson — 4 open; 2 urgent/high. AT RISK: Update Trust, Confirm FATCA/CRS Declarations"
+"For the Mendoza household, are the goals on file consistent with what they've actually been talking about in our recent calls and emails?","Reasoning: Must take a curated list (FinancialGoals) and compare against themes mined from free text (transcripts + emails) over 6 months. 
+Tests: bidirectional drift detection (goal on file but not discussed; topic discussed but not on file) with quote-level evidence - the hardest grounding test in the set.. Expected Answer Shape:  Two-column comparison 'Goals on file' vs 'Themes in recent conversations'; 'Drift detected' bullets; 1-line recommended action. . Pass Criteria:   Drift items real and quoted; no drift fabricated when aligned.Example Output:  Mendoza household consistency check:
+Goals on file: Franchise expansion; Retirement at 65; Legacy planning
+Recent call/email themes: [""Balancing franchise expansion with other financial goals"", ""Ensuring family comfort in retirement"", ""Smooth transition of assets to children""] | [""New restaurant openings"", ""Planning Sophia’s wedding""] | [""Ensuring financial readiness for early retirement"", ""Optimizing charitable giving tax benefits"", ""Managing real estate capital gains taxes""] | [""Luis taking on more responsibilities at the res
+Assessment: Aligned — succession planning surfaces in both stated goals and recent conversations."
+"Give me the full household picture for the Reynolds family - decision-makers, beneficiaries, business ties, trusts, and any recent family developments.","Reasoning: Multi-dimensional household synthesis with explicit knowledge-gap reporting. Pulls structured (Household JSON, MaritalStatus) and unstructured (notes, transcripts, trust docs) into 5 fixed sections, AND requires the agent to declare what's missing rather than fabricate. Plus the HH-001 trap: it contains two unrelated client owners (Jeremy Johnson + Alex Reynolds) - agent must surface this rather than pick one silently.. Expected Answer Shape:  5 sections: Decision-makers / Beneficiaries / Business ties / Trusts / Recent family developments. Closing 'Information gaps' section. . Pass Criteria:   All 5 sections present (with explicit 'none on file' where sparse); gaps section non-empty when sparse.Example Output:  Reynolds household — full picture:
+Decision-maker: Alexander L. Reynolds — High Net Worth, Married.
+ • Katherine Reynolds | Wife | outside assets $12.4M
+ • Ethan Reynolds | Son
+ • Olivia Reynolds | Daughter
+ Recent/upcoming: Partner buy-out; Twins starting college
+Decision-maker: Jeremy M. Johnson — High Net Worth, Married.
+ • Beth Johnson | Wife | outside assets $2.1M
+ • Patty Johnson | Mother
+ • Ben Johnson | Son
+ Recent/upcoming: Publishing book in February; Expecting grandchild next spring
+Business/trust ties (from open actions):
+ • Review Estate Plan — Ensure estate plan aligns with family goals.
+ • Estate Planning Review — Estate Planning Review with Jeremy M. Johnson
+ • Estate Planning Review — Estate Planning Review with Alexander L. Reynolds"
+"For each meeting on my calendar this week, give me the top three issues to address and the most relevant follow-up action.","Reasoning: Orchestration / fan-out stress test. Supervisor must loop the prep pipeline once per meeting in the window, the synthesizer must merge N variable-length blocks chronologically, and patterns across blocks ('common themes') must only appear if real. 
+Tests: supervisor's ability to NOT terminate after the first meeting + cross-block pattern detection. Latency stress test.. Expected Answer Shape:  One block per meeting in chronological order: Header | Top 3 issues (numbered) | Recommended follow-up (1 line, owner + due). Closing 'Common themes' callout if patterns exist. . Pass Criteria:   Every meeting in window has a block; exactly 3 issues each; chronological; follow-ups grounded.Example Output:  For each upcoming meeting this week — top 3 issues + key follow-up:
+• 2026-04-20 — Jeremy M. Johnson — Estate Planning Review
+ – [urgent] Tax Efficiency: Revisit recommendation to structure charitable giving through donor-advised funds (DAFs)
+ – [short-term] Asset Recommendation: Recommend alternative investments to enhance portfolio diversification
+ – [medium-term] Training: Complete Alternatives Module to prepare for client conversation
+ Follow-up: Research
+• 2026-04-20 — Alexander L. Reynolds — Estate Planning Review
+ – [urgent] Review Estate Plan: Ensure estate plan aligns with family goals.
+ – [short-term] Set Up DAF: Finalize donor-advised fund setup for tax benefits.
+ – [medium-term] Rebalance 529 Plans: Shift twins' 529 plans to conservative allocation.
+ Follow-up: Schedule Meeting
+• 2026-04-20 — Carlos A. Mendoza — Business Succession Planning
+ – [urgent] Finalize Trust: Complete Sophia's trust document setup.
+ – [short-term] Draft Succession Plan: Create business succession milestones for Luis.
+ – [medium-term] Increase SEP IRA: Adjust SEP IRA contributions for retirement goals.
+ Follow-up: Generate Proposal
+• 2026-04-21 — Daniel R. Goldstein — Business Succession Planning
+ – [urgent] Finalize Succession Plan: Ensure smooth transition of business to children.
+ – [short-term] Set Up Donor Fund: Establish donor-advised fund for desert conservation.
+ – [medium-term] Review Estate Plan: Ensure estate plan aligns with your goals.
+ Follow-up: Schedule Meeting
+• 2026-04-21 — Dr. James H. Washington — Retirement Planning
+ – [short-term] Update Trust: Coordinate with attorney to finalize dynasty trust.
+ – [medium-term] Rebalance 529: Adjust education fund allocation to 60% bonds.
+ – [short-term] Prepare Analysis: Prepare side-by-side practice transition options.
+ Follow-up: Manage"
