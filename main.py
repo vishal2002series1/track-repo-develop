@@ -1,11 +1,17 @@
 # main.py
+import os
 import uuid
 import sys
+import threading
+from datetime import datetime, timezone
+from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from opentelemetry.sdk.trace import TracerProvider as _SDKTracerProvider
+from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult, SimpleSpanProcessor
 
 from src.db.database import engine, SessionLocal, Base
 from src.db.models import DomainAgent, Workflow
@@ -15,8 +21,98 @@ from src.engine.dynamic_graph import build_dynamic_graph, get_llm, workflow_memo
 from src.agents.tools import AEON_TOOLS
 from langgraph.prebuilt import create_react_agent
 
+from arize.otel import register, Transport
+from openinference.instrumentation.langchain import LangChainInstrumentor
 
 
+class _SpanStore:
+    def __init__(self):
+        self._data: dict = {}
+        self._trace_to_session: dict = {}
+        self._lock = threading.Lock()
+
+    def register_session(self, trace_id: str, session_id: str):
+        with self._lock:
+            self._trace_to_session[trace_id] = session_id
+
+    def add_span(self, span):
+        trace_id = format(span.context.trace_id, '032x')
+        with self._lock:
+            session_id = self._trace_to_session.get(trace_id)
+            if not session_id:
+                return
+            start_ns = span.start_time
+            end_ns = span.end_time or start_ns
+            start_dt = datetime.fromtimestamp(start_ns / 1e9, tz=timezone.utc)
+            end_dt = datetime.fromtimestamp(end_ns / 1e9, tz=timezone.utc)
+            if session_id not in self._data:
+                self._data[session_id] = []
+            self._data[session_id].append({
+                "trace_id": trace_id,
+                "span_id": format(span.context.span_id, '016x'),
+                "name": span.name,
+                "start_time": start_dt.isoformat(),
+                "end_time": end_dt.isoformat(),
+                "latency_ms": round((end_ns - start_ns) / 1e6, 2),
+                "status": span.status.status_code.name,
+            })
+
+    def get_session(self, session_id: str) -> list:
+        with self._lock:
+            spans = list(self._data.get(session_id, []))
+        return sorted(spans, key=lambda x: x["start_time"])
+
+
+class _LocalSpanExporter(SpanExporter):
+    def __init__(self, store: _SpanStore):
+        self._store = store
+
+    def export(self, spans):
+        for span in spans:
+            self._store.add_span(span)
+        return SpanExportResult.SUCCESS
+
+    def shutdown(self):
+        pass
+
+
+span_store = _SpanStore()
+
+# --- Arize Telemetry Initialization ---
+load_dotenv()
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_arize_space_id = os.getenv("ARIZE_SPACE_ID")
+_arize_api_key = os.getenv("ARIZE_API_KEY")
+
+if _arize_space_id and _arize_api_key:
+    _cert_path = os.path.join(PROJECT_ROOT, "certificates", "windows-ca-bundle.pem")
+    os.environ["REQUESTS_CA_BUNDLE"] = _cert_path
+    os.environ["SSL_CERT_FILE"] = _cert_path
+    # Connectivity check — confirms the OTLP endpoint is reachable before registering
+    try:
+        import urllib.request
+        req = urllib.request.Request("https://otlp.arize.com/v1/traces", method="POST")
+        urllib.request.urlopen(req, timeout=5)
+    except urllib.error.HTTPError as _e:
+        # Any HTTP error (400, 401, 405...) means the host IS reachable — expected without a valid payload
+        print(f"✅  Arize endpoint reachable (HTTP {_e.code})")
+    except Exception as _e:
+        print(f"❌  Arize endpoint NOT reachable: {_e}")
+        print("    Traces will be silently dropped. Check corporate proxy / firewall settings.")
+    _tracer_provider = register(
+        space_id=_arize_space_id,
+        api_key=_arize_api_key,
+        project_name="AEON-2.0",
+        transport=Transport.HTTP,
+        endpoint="https://otlp.arize.com/v1/traces"
+    )
+    LangChainInstrumentor().instrument(tracer_provider=_tracer_provider)
+    # Use the base SDK method to ADD alongside Arize's BatchSpanProcessor,
+    # not Arize's overridden add_span_processor which would replace it.
+    _SDKTracerProvider.add_span_processor(_tracer_provider, SimpleSpanProcessor(_LocalSpanExporter(span_store)))
+    print("👁️  Arize Telemetry Active: Tracing all LLM calls and agent workflows.")
+else:
+    print("⚠️  Arize keys not found in .env. Telemetry disabled.")
 
 def debug_backend(message: str) -> None:
     print(f"[AEON BACKEND] {message}", file=sys.stderr, flush=True)
@@ -305,8 +401,8 @@ def execute_chat_workflow(request: ChatRequest, db: Session = Depends(get_db)):
         session_id = request.session_id or str(uuid.uuid4())
         config = {"configurable": {"thread_id": session_id}}
         debug_backend(f"/api/chat called for workflow_id={request.workflow_id} session_id={session_id}")
-        
-        graph = build_dynamic_graph(request.workflow_id, db) 
+
+        graph = build_dynamic_graph(request.workflow_id, db)
         debug_backend("Dynamic graph built successfully")
         
         inputs = {"messages": [HumanMessage(content=request.prompt)]}
@@ -341,3 +437,316 @@ def execute_chat_workflow(request: ChatRequest, db: Session = Depends(get_db)):
     except Exception as e:
         debug_backend(f"Workflow execution failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/client-details", tags=["Delta API"])
+def get_client_details():
+    """Return a mock client list payload for the frontend."""
+    return {
+        "clients": [
+            {
+                "id": "thompson-family",
+                "title": "Thompson Family",
+                "subtitle": "Large discretionary spend detected",
+                "detail": "43% increase in non-essential spending vs. 3-month baseline",
+                "metric": "High",
+                "urgency": "high",
+                "signalType": "spending_anomaly",
+                "impactScore": 92,
+                "recommendedAction": "Open Summary"
+            },
+            {
+                "id": "martinez-household",
+                "title": "Martinez Household",
+                "subtitle": "Goal progress off-track",
+                "detail": "College savings falling behind by $12,400 this quarter",
+                "metric": "Med",
+                "urgency": "medium",
+                "signalType": "goal_slippage",
+                "impactScore": 78,
+                "recommendedAction": "Open Summary"
+            },
+            {
+                "id": "chen-associates",
+                "title": "Chen & Associates",
+                "subtitle": "Portfolio drift detected",
+                "detail": "Equity allocation 8% over target after market rally",
+                "metric": "Med",
+                "urgency": "medium",
+                "signalType": "allocation_drift",
+                "impactScore": 74,
+                "recommendedAction": "Open Summary"
+            },
+            {
+                "id": "williams-estate",
+                "title": "Williams Estate",
+                "subtitle": "Tax-loss opportunity",
+                "detail": "Potential $18K harvest available before year-end",
+                "metric": "High",
+                "urgency": "high",
+                "signalType": "tax_harvest_opportunity",
+                "impactScore": 88,
+                "recommendedAction": "Open Summary"
+            }
+        ],
+        "total": 4,
+        "asOf": "2026-05-13T10:30:00Z"
+    }
+
+
+@app.get("/api/opportunities", tags=["Delta API"])
+def get_opportunities():
+    """Return a list of top opportunities to prioritize."""
+    return {
+        "opportunities": [
+            {
+            "id": "1",
+            "clientName": "Zara & Barry Block",
+            "title": "Cash Drag Detected",
+            "priority": "high",
+            "description": "Large idle cash position of $650K leading to under-investment vs long-term goals",
+            "metric": "Impact: 9.2",
+            "urgency": "high",
+            "opportunityId": "cash-drag"
+            },
+            {
+            "id": "2",
+            "clientName": "Marcus & Diana Chen",
+            "title": "RSU Concentration Risk",
+            "priority": "high",
+            "description": "75% of $2.1M portfolio in employer stock after recent vesting cycle",
+            "metric": "Impact: 9.0",
+            "urgency": "high",
+            "opportunityId": "rsu-concentration"
+            },
+            {
+            "id": "3",
+            "clientName": "Jennifer Okonkwo",
+            "title": "Retirement Catch-Up Window",
+            "priority": "high",
+            "description": "Age 52, under-funded 401(k) with $180K gap to target retirement income",
+            "metric": "Impact: 8.7",
+            "urgency": "high",
+            "opportunityId": "retirement-catchup"
+            },
+            {
+            "id": "4",
+            "clientName": "David & Rachel Kim",
+            "title": "Estate Planning Gap",
+            "priority": "medium",
+            "description": "Net worth crossed $5M threshold; no trust structure or beneficiary updates since 2019",
+            "metric": "Impact: 8.3",
+            "urgency": "medium",
+            "opportunityId": "estate-planning"
+            },
+            {
+            "id": "5",
+            "clientName": "Sofia Ramirez",
+            "title": "Business Exit Opportunity",
+            "priority": "medium",
+            "description": "Consulting practice valued at $1.2M; interested buyers identified, no succession plan",
+            "metric": "Impact: 8.1",
+            "urgency": "medium",
+            "opportunityId": "business-exit"
+            },
+            {
+            "id": "6",
+            "clientName": "Tom & Lisa Brennan",
+            "title": "Insurance Coverage Review",
+            "priority": "medium",
+            "description": "Life insurance gap of $500K identified; term policy expiring in 8 months",
+            "metric": "Impact: 7.6",
+            "urgency": "medium",
+            "opportunityId": "insurance-review"
+            }
+        ]
+}
+
+@app.get("/api/upcoming-meetings", tags=["Delta API"])
+def get_upcoming_meetings():
+    """Return a list of upcoming client and business meetings."""
+    return {
+  "meetings": [
+    {
+      "id": "meeting-1",
+      "title": "Meeting with Thomas Anderson",
+      "subtitle": "Today 2pm",
+      "detail": "529 plans, life insurance for new baby, estate planning, asset transfer follow-up",
+      "metric": "Pending",
+      "urgency": "medium",
+      "scheduledFor": "2026-05-13T14:00:00-04:00",
+      "type": "client-meeting",
+      "clientId": "thomas-anderson",
+      "status": "pending"
+    },
+    {
+      "id": "meeting-2",
+      "title": "Sarah Johnson - Q4 Review",
+      "subtitle": "In 2 hours",
+      "detail": "Portfolio performance review, rebalancing discussion, tax planning",
+      "metric": "Prepped",
+      "urgency": "high",
+      "scheduledFor": "2026-05-13T16:00:00-04:00",
+      "type": "client-meeting",
+      "clientId": "sarah-johnson",
+      "status": "prepped"
+    },
+    {
+      "id": "meeting-3",
+      "title": "Miller Enterprises",
+      "subtitle": "Tomorrow 10am",
+      "detail": "Business succession planning, liquidity event discussion",
+      "metric": "Ready",
+      "urgency": "medium",
+      "scheduledFor": "2026-05-14T10:00:00-04:00",
+      "type": "business-meeting",
+      "clientId": "miller-enterprises",
+      "status": "ready"
+    },
+    {
+      "id": "meeting-4",
+      "title": "Davidson Retirement",
+      "subtitle": "Friday 2pm",
+      "detail": "Social Security claiming strategy, income planning review",
+      "metric": "Pending",
+      "urgency": "low",
+      "scheduledFor": "2026-05-17T14:00:00-04:00",
+      "type": "client-meeting",
+      "clientId": "davidson-retirement",
+      "status": "pending"
+    }
+  ]
+}
+
+@app.get("/api/tasks-and-followups", tags=["Delta API"])
+def tasks_and_followups():
+    """Return a list of top tasks and follow-ups."""
+    return {
+        "tasks": [
+            {
+            "id": "task-001",
+            "type": "task",
+            "title": "Follow up: Thompson spending",
+            "subtitle": "Created by AI from recent alert",
+            "detail": "Draft check-in message about unusual spending patterns",
+            "metric": "Today",
+            "urgency": "high",
+            "status": "pending",
+            "source": "ai",
+            "clientId": "client-thompson",
+            "clientName": "Thompson",
+            "dueDate": "2026-05-14",
+            "createdAt": "2026-05-14T08:00:00Z"
+            },
+            {
+            "id": "task-002",
+            "type": "task",
+            "title": "Send: Chen rebalancing proposal",
+            "subtitle": "AI-generated recommendation",
+            "detail": "Review and send portfolio rebalancing suggestion",
+            "metric": "Today",
+            "urgency": "high",
+            "status": "pending",
+            "source": "ai",
+            "clientId": "client-chen",
+            "clientName": "Chen",
+            "dueDate": "2026-05-14",
+            "createdAt": "2026-05-14T08:00:00Z"
+            },
+            {
+            "id": "task-003",
+            "type": "task",
+            "title": "Schedule: Williams tax planning",
+            "subtitle": "Opportunity window closing",
+            "detail": "Book meeting to discuss tax-loss harvesting by Oct 15",
+            "metric": "This Week",
+            "urgency": "medium",
+            "status": "pending",
+            "source": "ai",
+            "clientId": "client-williams",
+            "clientName": "Williams",
+            "dueDate": "2026-05-18",
+            "createdAt": "2026-05-14T08:00:00Z"
+            }
+        ],
+        "meta": {
+            "total": 3,
+            "pending": 3,
+            "completed": 0
+        }
+    }
+@app.get("/api/tools", tags=["Delta API"])
+def tools_api():
+    """"Return a list of available tools and their descriptions."""
+    return {
+  "tools": {
+    "commandPane": [
+      {
+        "id": "prospecting",
+        "name": "Prospecting",
+        "icon": "UserSearch",
+        "route": "/prospecting",
+        "status": "active",
+        "backendRequired": false
+      },
+      {
+        "id": "financial-planning",
+        "name": "Financial Planning",
+        "icon": "FileText",
+        "route": "/financial-planning",
+        "status": "active",
+        "backendRequired": false
+      },
+      {
+        "id": "portfolio-analysis",
+        "name": "Portfolio Analysis",
+        "icon": "BarChart3",
+        "route": "/portfolio-analysis",
+        "status": "stub",
+        "backendRequired": true
+      },
+      {
+        "id": "client-management",
+        "name": "Client Management",
+        "icon": "Users",
+        "route": "/client-management",
+        "status": "stub",
+        "backendRequired": true
+      },
+      {
+        "id": "proposal-generator",
+        "name": "Proposal Generator",
+        "icon": "FileSignature",
+        "route": "/proposal-generator",
+        "status": "stub",
+        "backendRequired": true
+      },
+      {
+        "id": "performance-reports",
+        "name": "Performance Reports",
+        "icon": "TrendingUp",
+        "route": "/performance-reports",
+        "status": "stub",
+        "backendRequired": true
+      }
+    ],
+    "intelligence": [
+      {
+        "id": "market-insights",
+        "name": "Market Insights",
+        "icon": "BarChart3",
+        "route": "/market-insights",
+        "status": "stub",
+        "backendRequired": true
+      },
+      {
+        "id": "client-analytics",
+        "name": "Client Analytics",
+        "icon": "PieChart",
+        "route": "/client-analytics",
+        "status": "stub",
+        "backendRequired": true
+      }
+    ]
+  }
+}   
