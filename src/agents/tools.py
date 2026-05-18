@@ -216,11 +216,242 @@ def get_database_schema(table_names: list[str] = None) -> str:
     args = {"table_names": table_names} if table_names else {}
     return run_mcp_tool_sync("get_database_schema", args)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# WF_002 Pure-Math Tool Adapters
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Agent workflow:
+#   Step 1 → get_database_schema(...)  : confirm column names
+#   Step 2 → execute_sql(...)          : fetch rows from Azure PostgreSQL
+#   Step 3 → parse rows into dicts     : agent's responsibility
+#   Step 4 → call math tool(dicts)     : pure computation, no DB calls
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def compute_portfolio_metrics(
+    holdings: list[dict],
+    portfolio_data: dict,
+    client_details: dict,
+) -> str:
+    """
+    Compute portfolio snapshot metrics for a single client. Pure math — no database calls.
+
+    WHEN TO USE:
+      Any single-client portfolio state question:
+      - Asset allocation or sector breakdown  ("What % is in bonds?")
+      - Portfolio concentration / HHI         ("Is the client over-concentrated?")
+      - Risk profile vs holdings mismatch     ("Does allocation match risk tolerance?")
+      - Unrealized P&L                        ("What are the P&L figures?")
+      - Tax-loss harvesting opportunity       ("How much can be harvested?")
+      - Wallet share / outside assets         ("What share of wealth do we manage?")
+
+    DO NOT USE FOR:
+      - Return vs benchmark  → use compute_portfolio_return
+      - Advisor aggregation  → use analyze_advisor_book
+      - What-if reallocation → use simulate_reallocation
+
+    PRE-FETCH PATTERN — call execute_sql first, then pass results here:
+      holdings:
+        SELECT "Id", "AssetClass", "Sector", "SecurityName", "Ticker",
+               "MarketValue", "CostBasis", "UnrealizedPnL", "Weight", "AsOfDate"
+        FROM "Holdings" WHERE "ClientId" = 'CLI-001' ORDER BY "AsOfDate" DESC
+
+      portfolio_data:
+        SELECT "TotalValue", "TotalOutsideAssetsValue", "WalletShare",
+               "RiskTolerance", "RiskCategory", "BenchmarkReturn"
+        FROM "PortfolioData" WHERE "ClientId" = 'CLI-001'
+
+      client_details:
+        SELECT "Name", "TaxSensitivity", "Persona", "AttritionRisk"
+        FROM "ClientDetails" WHERE "ClientId" = 'CLI-001'
+
+    Args:
+        holdings:       List of dicts from Holdings rows.
+        portfolio_data: Dict from one PortfolioData row. Pass {} if unavailable.
+        client_details: Dict from one ClientDetails row. Pass {} if unavailable.
+    """
+    return run_mcp_tool_sync("compute_portfolio_metrics", {
+        "holdings":       holdings,
+        "portfolio_data": portfolio_data,
+        "client_details": client_details,
+    })
+
+
+@tool
+def compute_portfolio_return(
+    snapshot_t0: list[dict],
+    snapshot_t1: list[dict],
+    benchmark_return: float,
+    window: str = "custom",
+    date_t0: str = None,
+    date_t1: str = None,
+) -> str:
+    """
+    Compute portfolio return and benchmark comparison from two Holdings snapshots.
+    Pure math — no database calls.
+
+    WHEN TO USE:
+      - "What is the portfolio return over the last 3 months?"
+      - "How does the portfolio compare to its benchmark?"
+      - "What is the alpha in basis points?"
+      - "Which asset classes drove or dragged returns?"
+
+    DO NOT USE FOR:
+      - Single-snapshot metrics → use compute_portfolio_metrics
+      - Advisor aggregation     → use analyze_advisor_book
+
+    DATA REQUIREMENT — TWO SNAPSHOTS FROM DIFFERENT DATES:
+      If only one AsOfDate exists in the DB for the requested window,
+      this tool returns data_blocked=True. Do not call with identical snapshots.
+
+    PRE-FETCH PATTERN:
+      snapshot_t0:
+        SELECT "AssetClass", "MarketValue", "AsOfDate" FROM "Holdings"
+        WHERE "ClientId" = 'CLI-001' AND "AsOfDate" = '<start_date>'
+
+      snapshot_t1:
+        SELECT "AssetClass", "MarketValue", "AsOfDate" FROM "Holdings"
+        WHERE "ClientId" = 'CLI-001' AND "AsOfDate" = '<end_date>'
+
+      benchmark_return:
+        SELECT "BenchmarkReturn" FROM "PortfolioData" WHERE "ClientId" = 'CLI-001'
+
+    Args:
+        snapshot_t0:      Holdings rows at START of window.
+        snapshot_t1:      Holdings rows at END of window.
+        benchmark_return: Decimal return e.g. 0.072 = 7.2%. Pass 0.0 if unavailable.
+        window:           Label only — "1M"|"3M"|"6M"|"YTD"|"1Y"|"custom".
+        date_t0:          AsOfDate string of t0 snapshot (for labelling + same-date guard).
+        date_t1:          AsOfDate string of t1 snapshot (for labelling + same-date guard).
+    """
+    return run_mcp_tool_sync("compute_portfolio_return", {
+        "snapshot_t0":      snapshot_t0,
+        "snapshot_t1":      snapshot_t1,
+        "benchmark_return": benchmark_return,
+        "window":           window,
+        "date_t0":          date_t0,
+        "date_t1":          date_t1,
+    })
+
+
+@tool
+def analyze_advisor_book(
+    advisor_id: str,
+    mode: str,
+    clients_data: list[dict],
+    window: str = "6M",
+) -> str:
+    """
+    Advisor-scope aggregation across a book of clients. Pure math — no database calls.
+
+    WHEN TO USE:
+      Advisor-level questions spanning multiple clients:
+      - "What is the total AUM for advisor ADV-001?"         (mode=aum)
+      - "Which clients have consolidation opportunity?"       (mode=consolidation)
+      - "What is the estimated revenue for this advisor?"    (mode=revenue)
+      - "How did the advisor's book perform this quarter?"   (mode=performance)
+
+    DO NOT USE FOR:
+      - Single-client metrics → use compute_portfolio_metrics
+      - Single-client return  → use compute_portfolio_return
+      - What-if reallocation  → use simulate_reallocation
+
+    NOTE: advisor_id is TEXT e.g. 'ADV-001' — matches AdvisorDetails.AdvisorId column.
+
+    MODE GUIDE + PRE-FETCH PATTERN:
+      mode=aum:
+        clients_data keys: client_id, total_value, segment
+        fetch: SELECT cd."ClientId", pd."TotalValue", cd."Persona"
+               FROM "PortfolioData" pd JOIN "ClientDetails" cd USING ("ClientId")
+               WHERE cd."AdvisorId" = 'ADV-001'
+
+      mode=consolidation:
+        clients_data keys: client_id, total_value, outside_assets_value, segment
+        fetch: SELECT cd."ClientId", pd."TotalValue", pd."TotalOutsideAssetsValue", cd."Persona"
+               FROM "PortfolioData" pd JOIN "ClientDetails" cd USING ("ClientId")
+               WHERE cd."AdvisorId" = 'ADV-001'
+
+      mode=revenue:
+        clients_data keys: client_id, asset_breakdown ({asset_class: market_value}), segment
+        fetch: SELECT h."ClientId", h."AssetClass", SUM(h."MarketValue") as mv
+               FROM "Holdings" h JOIN "ClientDetails" cd USING ("ClientId")
+               WHERE cd."AdvisorId" = 'ADV-001' GROUP BY h."ClientId", h."AssetClass"
+        Then structure as: {"client_id": "CLI-001", "asset_breakdown": {"Equity": 500000}}
+
+      mode=performance:
+        clients_data keys: client_id, total_value, portfolio_return (decimal), segment
+        NOTE: run compute_portfolio_return per client FIRST, then aggregate here.
+
+    Args:
+        advisor_id:   Advisor ID string e.g. 'ADV-001'.
+        mode:         One of "aum" | "consolidation" | "revenue" | "performance".
+        clients_data: List of per-client dicts (schema varies by mode — see above).
+        window:       Label only — default "6M".
+    """
+    return run_mcp_tool_sync("analyze_advisor_book", {
+        "advisor_id":   advisor_id,
+        "mode":         mode,
+        "clients_data": clients_data,
+        "window":       window,
+    })
+
+
+@tool
+def simulate_reallocation(
+    current_holdings: list[dict],
+    target_weights: dict,
+) -> str:
+    """
+    Simulate a portfolio reallocation — compare current vs target expected return and risk.
+    Pure math — no database calls.
+
+    ⚠️ SIMULATION ONLY. Uses hard-coded long-run capital market assumptions.
+    Always surface the simulation_disclaimer from the output to the client.
+
+    WHEN TO USE:
+      - "What if we shift 20% from bonds to equities?"
+      - "Show risk/return trade-off of a proposed new allocation."
+      - "What would expected return be with these target weights?"
+
+    DO NOT USE FOR:
+      - Live portfolio metrics   → use compute_portfolio_metrics
+      - Historical return calc   → use compute_portfolio_return
+      - Advisor-book aggregation → use analyze_advisor_book
+
+    PRE-FETCH PATTERN:
+      current_holdings:
+        SELECT "AssetClass", "MarketValue" FROM "Holdings"
+        WHERE "ClientId" = 'CLI-001'
+        AND "AsOfDate" = (SELECT MAX("AsOfDate") FROM "Holdings" WHERE "ClientId" = 'CLI-001')
+
+    Args:
+        current_holdings: Holdings rows. Required keys: AssetClass, MarketValue.
+        target_weights:   Proposed allocation as decimals summing to 1.0 (±0.02 tolerance).
+                          Example: {"Equity": 0.60, "Fixed Income": 0.30, "Cash": 0.10}
+    """
+    return run_mcp_tool_sync("simulate_reallocation", {
+        "current_holdings": current_holdings,
+        "target_weights":   target_weights,
+    })
+
 # 🛑 Cleaned up AEON_TOOLS: Only these 5 tools exist in our universe now.
+# AEON_TOOLS = [
+#     execute_sql, 
+#     compute_portfolio_concentration, 
+#     search_transcripts, 
+#     get_database_schema,
+#     search_client_emails
+# ]
+
 AEON_TOOLS = [
-    execute_sql, 
-    compute_portfolio_concentration, 
-    search_transcripts, 
+    # DB / search tools
+    execute_sql,
     get_database_schema,
-    search_client_emails
+    search_transcripts,
+    search_client_emails,
+    # WF_002 pure-math tools
+    compute_portfolio_metrics,
+    compute_portfolio_return,
+    analyze_advisor_book,
+    simulate_reallocation,
 ]
