@@ -22,3 +22,7 @@ pydantic-settings
 langchain-huggingface
 sentence-transformers
 langchain_chroma
+langchain
+arize-otel
+opentelemetry-sdk
+opentelemetry-exporter-otlp
