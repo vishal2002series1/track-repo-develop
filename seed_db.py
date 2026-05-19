@@ -14,9 +14,18 @@ from src.db.models import DomainAgent, Workflow
 # on fresh Windows clones using your new default configuration if the file is missing!
 from src.agents.config import registry_manager 
 
+
+# 🆕 Trigger the checkpointer's own table creation against the SAME DB.
+# Importing workflow_memory runs its __init__ + setup() side-effects.
+from src.engine.dynamic_graph import workflow_memory
+
 def seed():
     print("⏳ Creating core database tables...")
     Base.metadata.create_all(bind=engine)
+
+    # 🆕 Checkpointer tables (idempotent — safe to re-run)
+    print("⏳ Ensuring LangGraph checkpointer tables exist...")
+    workflow_memory.setup()
     
     db = SessionLocal()
     

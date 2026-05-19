@@ -8,6 +8,9 @@ pydantic
 mcp
 python-dotenv
 langgraph-checkpoint-sqlite
+langgraph-checkpoint-postgres
+psycopg[binary]
+psycopg-pool
 psycopg2-binary
 arize
 arize-otel

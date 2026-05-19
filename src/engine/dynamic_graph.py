@@ -1,7 +1,6 @@
 # src/engine/dynamic_graph.py
 import operator
 import os
-import sqlite3
 import json
 from dotenv import load_dotenv
 from typing import Annotated, Sequence, TypedDict
@@ -9,16 +8,27 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMe
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.sqlite import SqliteSaver
+
+# 🟢 AZURE POSTGRESQL CHECKPOINTER (replaces local SqliteSaver)
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
 
 # AZURE MIGRATION: Swap Bedrock for Azure OpenAI
-from langchain_openai import AzureChatOpenAI 
+from langchain_openai import AzureChatOpenAI
 
 from sqlalchemy.orm import Session
 from src.db.database import SessionLocal
 from src.db.models import Workflow
-from src.agents.tools import AEON_TOOLS 
+from src.agents.tools import AEON_TOOLS
+from src.db.pg_connection import (
+    AZURE_PG_HOST,
+    AZURE_PG_DATABASE,
+    AZURE_PG_USER,
+    AZURE_PG_PASSWORD,
+    AZURE_PG_PORT,
+    AZURE_PG_SSLMODE,
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -35,15 +45,66 @@ def load_prompt_library():
         print(f"⚠️ Warning: Could not load prompt_library.json: {e}")
         return {"supervisor_rules": "", "synthesizer_persona": "You are a helpful assistant."}
 
-# --- PERSISTENT STATE MEMORY ---
-# We use SqliteSaver so threads survive server restarts and cross-platform tests
-DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../data_local/threads.sqlite'))
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+# --- PERSISTENT STATE MEMORY (AZURE POSTGRESQL) ---
+# 🟢 LangGraph checkpoints now live in Azure PostgreSQL instead of the local
+# data_local/threads.sqlite file. Tables are created on first run inside the
+# schema configured by CHECKPOINTER_PG_SCHEMA (default: "Checkpoints").
+#
+# Requires psycopg v3 (not psycopg2) — `pip install psycopg[binary] psycopg-pool langgraph-checkpoint-postgres`.
 
-# Create a connection that allows access from multiple threads (crucial for FastAPI)
-memory_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-workflow_memory = SqliteSaver(memory_conn)
-workflow_memory.setup() # Automatically creates the necessary memory tables
+CHECKPOINTER_PG_SCHEMA = os.getenv("CHECKPOINTER_PG_SCHEMA", "Checkpoints")
+
+# psycopg v3 connection string (note: no "+psycopg2" driver suffix; this is a
+# raw DBAPI URL, not a SQLAlchemy URL).
+_CHECKPOINTER_CONN_STRING = (
+    f"postgresql://{AZURE_PG_USER}:{AZURE_PG_PASSWORD}"
+    f"@{AZURE_PG_HOST}:{AZURE_PG_PORT}/{AZURE_PG_DATABASE}"
+    f"?sslmode={AZURE_PG_SSLMODE}"
+)
+
+# Eagerly create the checkpointer schema (PostgresSaver.setup() creates its
+# tables but does not create the containing schema).
+def _ensure_checkpointer_schema() -> None:
+    import psycopg
+    with psycopg.connect(_CHECKPOINTER_CONN_STRING, autocommit=True) as _c:
+        with _c.cursor() as _cur:
+            _cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{CHECKPOINTER_PG_SCHEMA}"')
+
+_ensure_checkpointer_schema()
+
+# PostgresSaver requires autocommit and prepare_threshold=0 per LangGraph docs.
+# We set search_path via a `configure` callback (not via libpq `options=-c
+# search_path=...`) because libpq lowercases unquoted identifiers in options,
+# which breaks mixed-case schema names like "Checkpoints".
+def _configure_checkpointer_conn(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(f'SET search_path TO "{CHECKPOINTER_PG_SCHEMA}"')
+
+_checkpointer_pool = ConnectionPool(
+    conninfo=_CHECKPOINTER_CONN_STRING,
+    max_size=20,
+    kwargs={
+        "autocommit": True,
+        "prepare_threshold": 0,
+    },
+    configure=_configure_checkpointer_conn,
+)
+
+workflow_memory = PostgresSaver(_checkpointer_pool)
+workflow_memory.setup()  # Idempotent — creates checkpoint tables on first run.
+
+# Ensure the connection pool's background worker threads are shut down cleanly
+# on interpreter exit. Without this, psycopg_pool prints warnings like:
+#   "couldn't stop thread 'pool-1-worker-0' within 5.0 seconds"
+import atexit as _atexit
+
+def _close_checkpointer_pool() -> None:
+    try:
+        _checkpointer_pool.close()
+    except Exception:
+        pass
+
+_atexit.register(_close_checkpointer_pool)
 # ----------------------------------
 
 # --- 1. Graph State Definition ---

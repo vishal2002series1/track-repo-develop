@@ -1,18 +1,32 @@
 # src/db/models.py
 from sqlalchemy import Column, String, Text, Table, ForeignKey, JSON
 from sqlalchemy.orm import relationship
-from src.db.database import Base
+from src.db.database import Base, AGENTS_PG_SCHEMA
+
+# 🟢 All Agent/Workflow tables live in the Azure PostgreSQL "Agents" schema.
 
 # Association Table for Many-to-Many mapping
 workflow_agent_association = Table(
     'workflow_agent_map',
     Base.metadata,
-    Column('workflow_id', String, ForeignKey('workflows.id'), primary_key=True),
-    Column('agent_id', String, ForeignKey('domain_agents.id'), primary_key=True)
+    Column(
+        'workflow_id',
+        String,
+        ForeignKey(f'{AGENTS_PG_SCHEMA}.workflows.id'),
+        primary_key=True,
+    ),
+    Column(
+        'agent_id',
+        String,
+        ForeignKey(f'{AGENTS_PG_SCHEMA}.domain_agents.id'),
+        primary_key=True,
+    ),
+    schema=AGENTS_PG_SCHEMA,
 )
 
 class DomainAgent(Base):
     __tablename__ = 'domain_agents'
+    __table_args__ = {'schema': AGENTS_PG_SCHEMA}
 
     id = Column(String, primary_key=True, index=True) # e.g., 'crm_activities_domain_agent'
     name = Column(String, nullable=False)
@@ -25,6 +39,7 @@ class DomainAgent(Base):
 
 class Workflow(Base):
     __tablename__ = 'workflows'
+    __table_args__ = {'schema': AGENTS_PG_SCHEMA}
 
     id = Column(String, primary_key=True, index=True) # e.g., 'WF_003'
     name = Column(String, nullable=False)
