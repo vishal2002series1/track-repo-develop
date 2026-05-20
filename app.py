@@ -146,10 +146,14 @@ elif page == "💬 Associate Workbench":
         st.subheader("Session Settings")
         session_id = st.text_input("Session ID", value="streamlit_demo_01")
         
-        # 🔀 NEW: Workflow Selector Dropdown
+         # 🔀 Workflow Selector — Auto-route + explicit options
         active_workflow = st.selectbox(
-            "Select Active Workflow", 
-            ["WF_002: Portfolio & Performance", "WF_003: Meeting Strategy"]
+            "Select Active Workflow",
+            [
+                "🤖 Auto-route (Router decides)",   # 🆕 lets the LLM router pick the workflow(s)
+                "WF_002: Portfolio & Performance",
+                "WF_003: Meeting Strategy",
+            ],
         )
         
         st.caption("Powered by LangGraph & Azure-Ready SQLite Checkpointing")

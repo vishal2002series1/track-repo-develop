@@ -16,6 +16,11 @@ from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult, Simpl
 from src.db.database import engine, SessionLocal, Base
 from src.db.models import DomainAgent, Workflow
 
+#Router specific imports
+from fastapi import BackgroundTasks
+from src.memory.episodic import EpisodicMemory
+from src.engine.router import plan_route, execute_plan, RoutePlan
+
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from src.engine.dynamic_graph import build_dynamic_graph, get_llm, workflow_memory
 from src.agents.tools import AEON_TOOLS
@@ -77,6 +82,11 @@ class _LocalSpanExporter(SpanExporter):
 
 
 span_store = _SpanStore()
+
+# Single process-wide episodic memory store (Chroma, MiniLM, local disk).
+# Migrating to pgvector later will require ONLY swapping the class behind
+# this name — no other code in main.py changes.
+episodic_memory = EpisodicMemory()
 
 # --- Arize Telemetry Initialization ---
 load_dotenv()
@@ -190,9 +200,20 @@ class MapAgentRequest(BaseModel):
     agent_id: str
 
 class ChatRequest(BaseModel):
-    workflow_id: str
+    # workflow_id is now optional. If omitted or set to "auto", the router decides.
+    workflow_id: Optional[str] = None
     prompt: str
     session_id: Optional[str] = None
+    # Identity scoping for episodic memory. Optional today — wire from the
+    # frontend when auth is available; defaults keep behavior backward-compatible.
+    user_id: Optional[str] = None
+    tenant_id: Optional[str] = "default"
+
+class PlanPreviewRequest(BaseModel):
+    prompt: str
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None
+    tenant_id: Optional[str] = "default"
 
 class ToolSchema(BaseModel):
     name: str
@@ -396,41 +417,90 @@ def get_chat_history(thread_id: str):
         raise HTTPException(status_code=500, detail=f"Error reading history: {str(e)}")
 
 @app.post("/api/chat", tags=["Execution"])
-def execute_chat_workflow(request: ChatRequest, db: Session = Depends(get_db)):
+def execute_chat_workflow(
+    request: ChatRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
     try:
         session_id = request.session_id or str(uuid.uuid4())
-        config = {"configurable": {"thread_id": session_id}}
-        debug_backend(f"/api/chat called for workflow_id={request.workflow_id} session_id={session_id}")
+        debug_backend(
+            f"/api/chat called workflow_id={request.workflow_id} "
+            f"session_id={session_id} user={request.user_id} tenant={request.tenant_id}"
+        )
 
-        graph = build_dynamic_graph(request.workflow_id, db)
-        debug_backend("Dynamic graph built successfully")
-        
-        inputs = {"messages": [HumanMessage(content=request.prompt)]}
-        trace = []
-        final_answer = ""
-        
-        for event in graph.stream(inputs, config=config, stream_mode="updates"):
-            if not event:
-                continue
-                
-            for node_name, state_update in event.items():
-                trace.append(node_name)
-                debug_backend(f"Graph emitted node update: {node_name}")
-                
-                if state_update is not None:
-                    messages = state_update.get("messages")
-                    if messages and isinstance(messages, list) and len(messages) > 0:
-                        if hasattr(messages[-1], 'content') and messages[-1].content:
-                            final_answer = messages[-1].content
+        # ----- Decide which path to run --------------------------------------
+        use_auto = (not request.workflow_id) or request.workflow_id.lower() == "auto"
 
-        debug_backend(f"Workflow execution completed with trace={trace}")
+        if not use_auto:
+            # ===== Existing explicit-workflow path (unchanged behavior) =====
+            config = {"configurable": {"thread_id": session_id}}
+            graph = build_dynamic_graph(request.workflow_id, db)
+            inputs = {"messages": [HumanMessage(content=request.prompt)]}
+
+            trace, final_answer = [], ""
+            for event in graph.stream(inputs, config=config, stream_mode="updates"):
+                if not event:
+                    continue
+                for node_name, state_update in event.items():
+                    trace.append(node_name)
+                    if state_update is not None:
+                        messages = state_update.get("messages")
+                        if messages and isinstance(messages, list) and len(messages) > 0:
+                            if hasattr(messages[-1], "content") and messages[-1].content:
+                                final_answer = messages[-1].content
+
+            routed_plan = None  # explicit mode has no plan
+
+        else:
+            # ===== Auto-route path (planner + executor) ======================
+            plan: RoutePlan = plan_route(
+                prompt=request.prompt,
+                db=db,
+                episodic_mem=episodic_memory,
+                session_id=session_id,
+                user_id=request.user_id,
+                tenant_id=request.tenant_id or "default",
+            )
+            debug_backend(
+                f"Router plan: mode={plan.mode} "
+                f"steps={[s.workflow_id for s in plan.steps]} "
+                f"confidence={plan.confidence}"
+            )
+            final_answer, trace = execute_plan(plan, request.prompt, session_id)
+            routed_plan = plan.model_dump()
+
+        # ----- Compute next turn index from the episodic store ---------------
+        prior = episodic_memory.recent(session_id=session_id, k=1)
+        next_turn_idx = (
+            (prior[0]["metadata"].get("turn_idx", -1) + 1) if prior else 0
+        )
+
+        # ----- Schedule episode write AFTER response is sent -----------------
+        background_tasks.add_task(
+            _write_episode_safe,
+            session_id=session_id,
+            turn_idx=next_turn_idx,
+            user_prompt=request.prompt,
+            final_answer=final_answer or "",
+            plan=routed_plan or {
+                "mode": "single",
+                "steps": [{"workflow_id": request.workflow_id, "subprompt": request.prompt}],
+                "confidence": "high",
+            },
+            confidence=(routed_plan or {}).get("confidence", "high"),
+            tenant_id=request.tenant_id or "default",
+            user_id=request.user_id,
+        )
+
         return {
-            "workflow_id": request.workflow_id,
+            "workflow_id": request.workflow_id if not use_auto else None,
             "session_id": session_id,
             "execution_trace": trace,
-            "final_answer": final_answer
+            "final_answer": final_answer,
+            "routed_plan": routed_plan,  # None in explicit mode, populated in auto mode
         }
-        
+
     except ValueError as ve:
         debug_backend(f"Workflow execution validation error: {ve}")
         raise HTTPException(status_code=404, detail=str(ve))
@@ -438,6 +508,31 @@ def execute_chat_workflow(request: ChatRequest, db: Session = Depends(get_db)):
         debug_backend(f"Workflow execution failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+def _write_episode_safe(**kwargs) -> None:
+    """Background task wrapper that never propagates errors to the response."""
+    try:
+        episodic_memory.record(**kwargs)
+    except Exception as e:
+        debug_backend(f"Episode write failed (non-fatal): {e}")
+
+@app.post("/api/router/plan", tags=["Execution"])
+def preview_route_plan(request: PlanPreviewRequest, db: Session = Depends(get_db)):
+    """Return what the router WOULD do, without executing. Useful for UI preview."""
+    session_id = request.session_id or "preview"
+    try:
+        plan = plan_route(
+            prompt=request.prompt,
+            db=db,
+            episodic_mem=episodic_memory,
+            session_id=session_id,
+            user_id=request.user_id,
+            tenant_id=request.tenant_id or "default",
+        )
+        return {"session_id": session_id, "plan": plan.model_dump()}
+    except Exception as e:
+        debug_backend(f"Plan preview failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/client-details", tags=["Delta API"])
 def get_client_details():

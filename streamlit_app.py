@@ -286,40 +286,83 @@ elif page == "Playground":
 # ==========================================
 elif page == "Execution Chat":
     st.title("LangGraph Chat Execution")
-    
+
     workflows = fetch_data("workflows")
     if workflows:
+        # 🆕 Prepend an "Auto-route" pseudo-option to the real workflows list.
+        AUTO_OPTION = {"id": "__auto__", "name": "🤖 Auto-route (Router decides)"}
+        wf_options = [AUTO_OPTION] + list(workflows)
+
         col1, col2 = st.columns([1, 1])
-        selected_wf = col1.selectbox("Select Active Workflow", workflows, format_func=lambda x: x["name"])
-        session_id = col2.text_input("Session ID (Leave blank to generate new, or enter an old one to resume)", value="thread-test-1")
-        
+        selected_wf = col1.selectbox(
+            "Select Active Workflow",
+            wf_options,
+            format_func=lambda x: x["name"],
+        )
+        session_id = col2.text_input(
+            "Session ID (Leave blank to generate new, or enter an old one to resume)",
+            value="thread-test-1",
+        )
+
+        # 🆕 Optional identity fields — wire to real auth later.
+        col3, col4 = st.columns([1, 1])
+        user_id = col3.text_input("User ID (optional)", value="")
+        tenant_id = col4.text_input("Tenant ID", value="default")
+
         st.divider()
-        
-        # Load History
+
+        # Load History (unchanged)
         if session_id:
             history = fetch_data(f"sessions/{session_id}/history")
             if history and history.get("messages"):
                 for msg in history["messages"]:
                     with st.chat_message(msg["role"]):
                         st.write(msg["content"])
-        
+
         # Chat Input
         if prompt := st.chat_input("Send a message to the workflow..."):
             with st.chat_message("user"):
                 st.write(prompt)
-                
-            with st.spinner("Executing Workflow Graph..."):
+
+            is_auto = selected_wf["id"] == "__auto__"
+            spinner_msg = (
+                "🤖 Router planning and executing..."
+                if is_auto
+                else "Executing Workflow Graph..."
+            )
+
+            with st.spinner(spinner_msg):
                 payload = {
-                    "workflow_id": selected_wf["id"],
                     "prompt": prompt,
-                    "session_id": session_id if session_id else None
+                    "session_id": session_id if session_id else None,
                 }
+                # In Auto mode, omit workflow_id so the backend router decides.
+                if not is_auto:
+                    payload["workflow_id"] = selected_wf["id"]
+                # Pass identity through only if filled in.
+                if user_id.strip():
+                    payload["user_id"] = user_id.strip()
+                if tenant_id.strip():
+                    payload["tenant_id"] = tenant_id.strip()
+
                 res = post_data("chat", payload)
-                
+
                 if res:
                     with st.chat_message("ai"):
-                        st.write(res["final_answer"])
-                        with st.expander("View Graph Trace"):
-                            st.json(res["execution_trace"])
+                        st.write(res.get("final_answer", ""))
+
+                        # 🆕 Show the router's plan (only present in auto mode)
+                        routed_plan = res.get("routed_plan")
+                        execution_trace = res.get("execution_trace")
+
+                        if routed_plan or execution_trace:
+                            with st.expander("🔍 Graph Trace / Router Plan"):
+                                if routed_plan:
+                                    st.markdown("**🤖 Router Plan**")
+                                    st.json(routed_plan)
+                                    st.markdown("---")
+                                if execution_trace:
+                                    st.markdown("**Execution Trace**")
+                                    st.json(execution_trace)
     else:
         st.warning("Please create a workflow in the Workflow Manager first.")
