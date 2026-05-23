@@ -5,29 +5,36 @@ import os
 import sys
 import threading
 from langchain_core.tools import tool
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+# from mcp import ClientSession, StdioServerParameters
+# from mcp.client.stdio import stdio_client
+
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 
 
 def _debug(message: str) -> None:
     print(f"[AEON MCP CLIENT] {message}", file=sys.stderr, flush=True)
 
-# --- 🔍 Robust Path Resolution for MCP Server ---
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
-path_option_1 = os.path.join(BASE_DIR, 'src', 'mcp', 'sqlite_server.py')
-path_option_2 = os.path.join(BASE_DIR, 'src', 'mcp_server', 'server.py')
+# # --- 🔍 Robust Path Resolution for MCP Server ---
+# BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+# path_option_1 = os.path.join(BASE_DIR, 'src', 'mcp', 'sqlite_server.py')
+# path_option_2 = os.path.join(BASE_DIR, 'src', 'mcp_server', 'server.py')
 
-if os.path.exists(path_option_1):
-    SERVER_SCRIPT_PATH = path_option_1
-else:
-    SERVER_SCRIPT_PATH = path_option_2
+# if os.path.exists(path_option_1):
+#     SERVER_SCRIPT_PATH = path_option_1
+# else:
+#     SERVER_SCRIPT_PATH = path_option_2
+
+## Change 1
+
+AZURE_MCP_ENDPOINT = os.getenv("AZURE_MCP_ENDPOINT", "http://localhost:8080/sse")
 
 # --- Persistent MCP Client ---
 class _PersistentMCPClient:
     """Keeps one FastMCP stdio session alive across repeated tool calls."""
 
-    def __init__(self, server_script_path: str):
-        self.server_script_path = server_script_path
+    def __init__(self):
+        # self.server_script_path = server_script_path
         self._lock = threading.RLock()
         self._loop = None
         self._thread = None
@@ -39,12 +46,17 @@ class _PersistentMCPClient:
         if self._session is not None:
             return
 
-        _debug(f"Starting FastMCP server process: {self.server_script_path}")
-        server_params = StdioServerParameters(
-            command=sys.executable,
-            args=[self.server_script_path],
-        )
-        self._stdio_cm = stdio_client(server_params)
+        _debug(f"Connecting to remote MCP server at: {AZURE_MCP_ENDPOINT}")
+        # server_params = StdioServerParameters(
+        #     command=sys.executable,
+        #     args=[self.server_script_path],
+        # )
+        # self._stdio_cm = stdio_client(server_params)
+        # read, write = await self._stdio_cm.__aenter__()
+        # --- ADD THESE LINES INSTEAD ---
+        # --- ADD THESE LINES INSTEAD ---
+        ## Change 2 
+        self._stdio_cm = sse_client(url=AZURE_MCP_ENDPOINT)
         read, write = await self._stdio_cm.__aenter__()
         self._session_cm = ClientSession(read, write)
         self._session = await self._session_cm.__aenter__()
@@ -152,7 +164,10 @@ class _PersistentMCPClient:
             thread.join(timeout=2)
 
 
-_MCP_CLIENT = _PersistentMCPClient(SERVER_SCRIPT_PATH)
+# _MCP_CLIENT = _PersistentMCPClient(SERVER_SCRIPT_PATH)
+# NEW:
+# Change 3
+_MCP_CLIENT = _PersistentMCPClient()
 atexit.register(_MCP_CLIENT.close)
 
 def run_mcp_tool_sync(tool_name: str, args: dict) -> str:
@@ -443,12 +458,25 @@ def simulate_reallocation(
 #     search_client_emails
 # ]
 
+# AEON_TOOLS = [
+#     # DB / search tools
+#     execute_sql,
+#     get_database_schema,
+#     search_transcripts,
+#     search_client_emails,
+#     # WF_002 pure-math tools
+#     compute_portfolio_metrics,
+#     compute_portfolio_return,
+#     analyze_advisor_book,
+#     simulate_reallocation,
+# ]
+
 AEON_TOOLS = [
     # DB / search tools
     execute_sql,
     get_database_schema,
-    search_transcripts,
-    search_client_emails,
+    # search_transcripts,     <-- Comment this out
+    # search_client_emails,   <-- Comment this out
     # WF_002 pure-math tools
     compute_portfolio_metrics,
     compute_portfolio_return,
