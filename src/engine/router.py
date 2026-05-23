@@ -127,16 +127,21 @@ def _render_episodes_for_prompt(rows: List[Dict[str, Any]], header: str) -> str:
     if not rows:
         return f"{header}: (none)"
     out = [f"{header}:"]
+    ## Change 1 Start: render the full conversation turn instead of just metadata
     for r in rows:
         meta = r.get("metadata", {})
+        # FIX: Grab the whole document and replace newlines so it stays compact
+        full_doc = r.get('document', '').replace('\n---\n', ' | AI Answer: ')[:500] 
         out.append(
-            f"  - prompt: {r.get('document', '').splitlines()[0][:240]}\n"
+            f"  - Turn: {full_doc}\n"
             f"    plan_workflows: {meta.get('workflow_ids', '')}  "
             f"(confidence: {meta.get('confidence', '?')})"
         )
     return "\n".join(out)
+    ##Change 1 End
+    
 
-
+### Change 2 Start
 # --- 3. Planner --------------------------------------------------------------
 _PLANNER_SYSTEM = """\
 You are the Router for the Aeon Wealth backend. Your job is to decide which
@@ -147,14 +152,15 @@ RULES:
 - Prefer mode="single" unless the request clearly spans multiple workflows.
 - Use mode="sequential" when one step's output is needed by the next.
 - Use mode="parallel" only for truly independent sub-tasks.
-- Use mode="clarify" (and fill 'clarification') if the request is ambiguous
-  in a way the user can resolve with one short question.
+- Use mode="clarify" (and fill 'clarification') if the request is ambiguous.
 - Use mode="reject" if no workflow fits.
 - At most 3 steps total. Never repeat the same workflow_id in one plan.
-- Each step's 'subprompt' MUST be a focused rewrite of the user's request
-  scoped to that workflow. Do not just copy the original prompt.
+- CRITICAL: If the user's prompt contains pronouns (he, she, it, they, this), you MUST look at the 'RECENT TURNS' to figure out who or what they are talking about.
+- Each step's 'subprompt' MUST be a focused rewrite of the user's request. You MUST replace all pronouns with the actual client names or entities from the recent context. Do not just copy the original prompt.
 - Set confidence honestly. If similar past episodes strongly match, use "high".
 """
+
+### Change 2 End
 
 _PLANNER_HUMAN = """\
 WORKFLOW CATALOG:
