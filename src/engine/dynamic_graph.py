@@ -3,7 +3,7 @@ import operator
 import os
 import json
 from dotenv import load_dotenv
-from typing import Annotated, Sequence, TypedDict
+from typing import Annotated, Sequence, TypedDict, List ## Change 1 : Parallel : added List
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import StateGraph, END
@@ -12,7 +12,7 @@ from langgraph.prebuilt import create_react_agent
 # 🟢 AZURE POSTGRESQL CHECKPOINTER (replaces local SqliteSaver)
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg_pool import ConnectionPool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field  ## Change 2: Parallel : added Field
 
 # AZURE MIGRATION: Swap Bedrock for Azure OpenAI
 from langchain_openai import AzureChatOpenAI
@@ -110,7 +110,7 @@ _atexit.register(_close_checkpointer_pool)
 # --- 1. Graph State Definition ---
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
-    next: str
+    next: List[str] ## Change 3 : Parallel : Added List[str] to allow multiple next nodes for parallel execution
 
 # --- 2. LLM Initialization ---
 def get_llm():
@@ -228,8 +228,16 @@ def build_dynamic_graph(workflow_id: str, db: Session):
     # Append the dynamic rules instead of hardcoded strings
     system_prompt += active_supervisor_rules
 
+    ## Change 4: Parallel : # 👈 CHANGED: Dynamic Pydantic schema expects a list
+
     class Route(BaseModel):
-        next: str
+        next: List[str] = Field(
+            description=(
+                f"A list of agent names to route to. Options are: {options}. "
+                "If multiple distinct tasks are required, list multiple agents to run them in parallel. "
+                "If the task is fully complete, return ['synthesizer']."
+            )
+        )
 
     def supervisor_node(state: AgentState):
         llm = get_llm()
@@ -238,14 +246,16 @@ def build_dynamic_graph(workflow_id: str, db: Session):
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
-            ("human", "Here is the conversation history:\n\n{history}\n\nBased on the history and the latest user request, who should act next? Select one of: {options}")
+            ("human", "Here is the conversation history:\n\n{history}\n\nBased on the history and the latest user request, who should act next? Select one or more from: {options}")
         ]).partial(options=str(options))
         
         supervisor_chain = prompt | llm.with_structured_output(Route)
         result = supervisor_chain.invoke({"history": clean_history})
         
         print(f"🔗 [SUPERVISOR] Routing to: {result.next}")
-        return {"next": result.next}
+        return {"next": result.next} # 👈 Returns a list like ["agent_1", "agent_2"]
+
+    ## Change 4: End
 
     builder = StateGraph(AgentState)
     builder.add_node("supervisor", supervisor_node)
