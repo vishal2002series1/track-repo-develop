@@ -2,6 +2,7 @@
 import os
 import uuid
 import sys
+import json
 import threading
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -12,6 +13,12 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from opentelemetry.sdk.trace import TracerProvider as _SDKTracerProvider
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult, SimpleSpanProcessor
+
+### SSE Change1: Added for streaming execution endpoint
+from fastapi.responses import StreamingResponse
+from src.engine.router import execute_plan_stream
+
+### SSE Change 1 End
 
 from src.db.database import engine, SessionLocal, Base
 from src.db.models import DomainAgent, Workflow
@@ -416,97 +423,174 @@ def get_chat_history(thread_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading history: {str(e)}")
 
+# @app.post("/api/chat", tags=["Execution"])
+# def execute_chat_workflow(
+#     request: ChatRequest,
+#     background_tasks: BackgroundTasks,
+#     db: Session = Depends(get_db),
+# ):
+#     try:
+#         session_id = request.session_id or str(uuid.uuid4())
+#         debug_backend(
+#             f"/api/chat called workflow_id={request.workflow_id} "
+#             f"session_id={session_id} user={request.user_id} tenant={request.tenant_id}"
+#         )
+
+#         # ----- Decide which path to run --------------------------------------
+#         use_auto = (not request.workflow_id) or request.workflow_id.lower() == "auto"
+
+#         if not use_auto:
+#             # ===== Existing explicit-workflow path (unchanged behavior) =====
+#             config = {"configurable": {"thread_id": session_id}}
+#             graph = build_dynamic_graph(request.workflow_id, db)
+#             inputs = {"messages": [HumanMessage(content=request.prompt)]}
+
+#             trace, final_answer = [], ""
+#             for event in graph.stream(inputs, config=config, stream_mode="updates"):
+#                 if not event:
+#                     continue
+#                 for node_name, state_update in event.items():
+#                     trace.append(node_name)
+#                     if state_update is not None:
+#                         messages = state_update.get("messages")
+#                         if messages and isinstance(messages, list) and len(messages) > 0:
+#                             if hasattr(messages[-1], "content") and messages[-1].content:
+#                                 final_answer = messages[-1].content
+
+#             routed_plan = None  # explicit mode has no plan
+
+#         else:
+#             # ===== Auto-route path (planner + executor) ======================
+#             plan: RoutePlan = plan_route(
+#                 prompt=request.prompt,
+#                 db=db,
+#                 episodic_mem=episodic_memory,
+#                 session_id=session_id,
+#                 user_id=request.user_id,
+#                 tenant_id=request.tenant_id or "default",
+#             )
+#             debug_backend(
+#                 f"Router plan: mode={plan.mode} "
+#                 f"steps={[s.workflow_id for s in plan.steps]} "
+#                 f"confidence={plan.confidence}"
+#             )
+#             final_answer, trace = execute_plan(plan, request.prompt, session_id)
+#             routed_plan = plan.model_dump()
+
+#         # ----- Compute next turn index from the episodic store ---------------
+#         prior = episodic_memory.recent(session_id=session_id, k=1)
+#         next_turn_idx = (
+#             (prior[0]["metadata"].get("turn_idx", -1) + 1) if prior else 0
+#         )
+
+#         # ----- Schedule episode write AFTER response is sent -----------------
+#         background_tasks.add_task(
+#             _write_episode_safe,
+#             session_id=session_id,
+#             turn_idx=next_turn_idx,
+#             user_prompt=request.prompt,
+#             final_answer=final_answer or "",
+#             plan=routed_plan or {
+#                 "mode": "single",
+#                 "steps": [{"workflow_id": request.workflow_id, "subprompt": request.prompt}],
+#                 "confidence": "high",
+#             },
+#             confidence=(routed_plan or {}).get("confidence", "high"),
+#             tenant_id=request.tenant_id or "default",
+#             user_id=request.user_id,
+#         )
+
+#         return {
+#             "workflow_id": request.workflow_id if not use_auto else None,
+#             "session_id": session_id,
+#             "execution_trace": trace,
+#             "final_answer": final_answer,
+#             "routed_plan": routed_plan,  # None in explicit mode, populated in auto mode
+#         }
+
+#     except ValueError as ve:
+#         debug_backend(f"Workflow execution validation error: {ve}")
+#         raise HTTPException(status_code=404, detail=str(ve))
+#     except Exception as e:
+#         debug_backend(f"Workflow execution failed: {e}")
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+## SSE Change 2: New streaming execution endpoint -------------------------------------------------------------
+
 @app.post("/api/chat", tags=["Execution"])
 def execute_chat_workflow(
     request: ChatRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    try:
-        session_id = request.session_id or str(uuid.uuid4())
-        debug_backend(
-            f"/api/chat called workflow_id={request.workflow_id} "
-            f"session_id={session_id} user={request.user_id} tenant={request.tenant_id}"
-        )
+    session_id = request.session_id or str(uuid.uuid4())
+    debug_backend(f"/api/chat SSE called workflow_id={request.workflow_id} session_id={session_id}")
 
-        # ----- Decide which path to run --------------------------------------
-        use_auto = (not request.workflow_id) or request.workflow_id.lower() == "auto"
+    use_auto = (not request.workflow_id) or request.workflow_id.lower() == "auto"
 
-        if not use_auto:
-            # ===== Existing explicit-workflow path (unchanged behavior) =====
-            config = {"configurable": {"thread_id": session_id}}
-            graph = build_dynamic_graph(request.workflow_id, db)
-            inputs = {"messages": [HumanMessage(content=request.prompt)]}
+    def event_stream():
+        # 1. Start the Stream
+        yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing request...'})}\n\n"
+        
+        try:
+            if not use_auto:
+                # We mock a RoutePlan to reuse our new streaming executor
+                mock_plan = RoutePlan(
+                    mode="single",
+                    steps=[{"workflow_id": request.workflow_id, "subprompt": request.prompt}],
+                    confidence="high"
+                )
+                yield from execute_plan_stream(mock_plan, request.prompt, session_id)
+            else:
+                # 2. Plan Route
+                plan: RoutePlan = plan_route(
+                    prompt=request.prompt,
+                    db=db,
+                    episodic_mem=episodic_memory,
+                    session_id=session_id,
+                    user_id=request.user_id,
+                    tenant_id=request.tenant_id or "default",
+                )
+                
+                # Instantly tell the frontend what the Router decided!
+                yield f"data: {json.dumps({'type': 'status', 'message': f'Router chose {plan.mode} mode with confidence: {plan.confidence}'})}\n\n"
+                
+                # 3. Execute and Stream
+                # The generator yields "status", "token", and "complete" events natively
+                final_answer = ""
+                for sse_event in execute_plan_stream(plan, request.prompt, session_id):
+                    yield sse_event
+                    # We can parse the final answer out of the complete event to save to Episodic memory
+                    if '"type": "complete"' in sse_event:
+                        event_dict = json.loads(sse_event.replace("data: ", ""))
+                        final_answer = event_dict.get("final_answer", "")
 
-            trace, final_answer = [], ""
-            for event in graph.stream(inputs, config=config, stream_mode="updates"):
-                if not event:
-                    continue
-                for node_name, state_update in event.items():
-                    trace.append(node_name)
-                    if state_update is not None:
-                        messages = state_update.get("messages")
-                        if messages and isinstance(messages, list) and len(messages) > 0:
-                            if hasattr(messages[-1], "content") and messages[-1].content:
-                                final_answer = messages[-1].content
+                # 4. Save to Memory (in the background, so it doesn't slow down the stream closure)
+                prior = episodic_memory.recent(session_id=session_id, k=1)
+                next_turn_idx = ((prior[0]["metadata"].get("turn_idx", -1) + 1) if prior else 0)
+                
+                background_tasks.add_task(
+                    _write_episode_safe,
+                    session_id=session_id,
+                    turn_idx=next_turn_idx,
+                    user_prompt=request.prompt,
+                    final_answer=final_answer,
+                    plan=plan.model_dump(),
+                    confidence=plan.confidence,
+                    tenant_id=request.tenant_id or "default",
+                    user_id=request.user_id,
+                )
 
-            routed_plan = None  # explicit mode has no plan
+        except Exception as e:
+            debug_backend(f"Streaming execution failed: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
-        else:
-            # ===== Auto-route path (planner + executor) ======================
-            plan: RoutePlan = plan_route(
-                prompt=request.prompt,
-                db=db,
-                episodic_mem=episodic_memory,
-                session_id=session_id,
-                user_id=request.user_id,
-                tenant_id=request.tenant_id or "default",
-            )
-            debug_backend(
-                f"Router plan: mode={plan.mode} "
-                f"steps={[s.workflow_id for s in plan.steps]} "
-                f"confidence={plan.confidence}"
-            )
-            final_answer, trace = execute_plan(plan, request.prompt, session_id)
-            routed_plan = plan.model_dump()
+    # Return the stream! The frontend must consume this using an EventSource or fetch reader.
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-        # ----- Compute next turn index from the episodic store ---------------
-        prior = episodic_memory.recent(session_id=session_id, k=1)
-        next_turn_idx = (
-            (prior[0]["metadata"].get("turn_idx", -1) + 1) if prior else 0
-        )
+### Change SSE 2 End
 
-        # ----- Schedule episode write AFTER response is sent -----------------
-        background_tasks.add_task(
-            _write_episode_safe,
-            session_id=session_id,
-            turn_idx=next_turn_idx,
-            user_prompt=request.prompt,
-            final_answer=final_answer or "",
-            plan=routed_plan or {
-                "mode": "single",
-                "steps": [{"workflow_id": request.workflow_id, "subprompt": request.prompt}],
-                "confidence": "high",
-            },
-            confidence=(routed_plan or {}).get("confidence", "high"),
-            tenant_id=request.tenant_id or "default",
-            user_id=request.user_id,
-        )
-
-        return {
-            "workflow_id": request.workflow_id if not use_auto else None,
-            "session_id": session_id,
-            "execution_trace": trace,
-            "final_answer": final_answer,
-            "routed_plan": routed_plan,  # None in explicit mode, populated in auto mode
-        }
-
-    except ValueError as ve:
-        debug_backend(f"Workflow execution validation error: {ve}")
-        raise HTTPException(status_code=404, detail=str(ve))
-    except Exception as e:
-        debug_backend(f"Workflow execution failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 def _write_episode_safe(**kwargs) -> None:

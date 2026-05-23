@@ -25,6 +25,14 @@ from sqlalchemy.orm import Session
 from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 
+## CHange for SSE1 Start
+import queue
+from fastapi.responses import StreamingResponse
+
+## End Change
+
+
+
 from src.db.database import SessionLocal
 from src.db.models import Workflow
 from src.engine.dynamic_graph import build_dynamic_graph, get_llm
@@ -139,7 +147,7 @@ def _render_episodes_for_prompt(rows: List[Dict[str, Any]], header: str) -> str:
         )
     return "\n".join(out)
     ##Change 1 End
-    
+
 
 ### Change 2 Start
 # --- 3. Planner --------------------------------------------------------------
@@ -158,6 +166,7 @@ RULES:
 - CRITICAL: If the user's prompt contains pronouns (he, she, it, they, this), you MUST look at the 'RECENT TURNS' to figure out who or what they are talking about.
 - Each step's 'subprompt' MUST be a focused rewrite of the user's request. You MUST replace all pronouns with the actual client names or entities from the recent context. Do not just copy the original prompt.
 - Set confidence honestly. If similar past episodes strongly match, use "high".
+- Prefer mode="single" unless the request clearly spans MULTIPLE DIFFERENT workflows. If the user asks for multiple things that fall under the SAME workflow (like comparing two clients), use mode="single" and ask for them together.
 """
 
 ### Change 2 End
@@ -211,29 +220,38 @@ def plan_route(
         "prompt": prompt,
     })
 
+    ### Change 3 : Execution level corrections
+
     # Safety rails.
     valid_ids = {wf["workflow_id"] for wf in catalog}
     plan.steps = [s for s in plan.steps if s.workflow_id in valid_ids][:max_steps]
-    # Drop duplicates while preserving order.
-    seen, dedup = set(), []
+    
+    # 🛠️ NEW: Merge duplicates instead of dropping them
+    merged_steps = {}
+    dedup = []
     for s in plan.steps:
-        if s.workflow_id not in seen:
-            seen.add(s.workflow_id)
+        if s.workflow_id not in merged_steps:
+            merged_steps[s.workflow_id] = s
             dedup.append(s)
+        else:
+            # If the router calls the same workflow again, append the request
+            merged_steps[s.workflow_id].subprompt += f"\n\nAlso address this: {s.subprompt}"
+            
     plan.steps = dedup
 
+    # 🛠️ NEW: Ensure mode falls back to 'single' if we consolidated everything into one step
     if plan.mode in ("single", "sequential", "parallel") and not plan.steps:
         plan.mode = "clarify"
-        plan.clarification = plan.clarification or (
-            "I couldn't confidently match your request to a workflow. "
-            "Could you rephrase what you'd like me to do?"
-        )
+        # ... (keep existing clarify text)
+        
     if plan.mode == "single" and len(plan.steps) > 1:
         plan.mode = "sequential"
-    if plan.mode == "sequential" and len(plan.steps) == 1:
+    if plan.mode in ("sequential", "parallel") and len(plan.steps) == 1:
         plan.mode = "single"
+        
     return plan
 
+    ### Change 3 End
 
 # --- 4. Executor -------------------------------------------------------------
 def _run_one_step(
@@ -358,3 +376,129 @@ def execute_plan(
 
     # Fallback (shouldn't reach here).
     return ("Router produced an unsupported mode.", trace)
+
+
+##. Change SSE 2 Start: Streaming version of the executor -------------------------------------------------------------
+# --- 5. Streaming Executor (SSE) ---------------------------------------------
+def _run_one_step_stream(
+    workflow_id: str,
+    composed_prompt: str,
+    session_id: str,
+    event_queue: queue.Queue
+) -> None:
+    """Runs a workflow and pushes real-time events to the queue."""
+    db = SessionLocal()
+    try:
+        graph = build_dynamic_graph(workflow_id, db)
+        thread_id = f"{session_id}::{workflow_id}"
+        config = {"configurable": {"thread_id": thread_id}}
+        inputs = {"messages": [HumanMessage(content=composed_prompt)]}
+
+        trace = []
+        final_answer = ""
+        
+        event_queue.put({"type": "status", "message": f"Initializing {workflow_id}..."})
+
+        # stream_mode="messages" allows us to catch token-by-token LLM output
+        for event in graph.stream(inputs, config=config, stream_mode="messages"):
+            msg, metadata = event
+            
+            # If it's a token streaming from the AI
+            if msg.content and metadata.get("langgraph_node") == "synthesizer":
+                event_queue.put({"type": "token", "chunk": msg.content})
+                final_answer += msg.content
+                
+            # If it's a tool call or intermediate agent routing
+            elif metadata.get("langgraph_node") != "synthesizer" and msg.name:
+                 event_queue.put({"type": "status", "message": f"Running tool: {msg.name}..."})
+                 trace.append(f"{workflow_id}:{msg.name}")
+
+        event_queue.put({"type": "step_complete", "workflow_id": workflow_id, "answer": final_answer, "trace": trace})
+    except Exception as e:
+        event_queue.put({"type": "error", "message": str(e)})
+    finally:
+        db.close()
+
+def execute_plan_stream(plan: RoutePlan, original_prompt: str, session_id: str):
+    """Generator that yields SSE JSON strings for the FastAPI StreamingResponse."""
+    q = queue.Queue()
+    trace = [f"router:{plan.mode}"]
+    
+    if plan.mode in ("clarify", "reject"):
+        ans = plan.clarification if plan.mode == "clarify" else plan.reason
+        yield f"data: {json.dumps({'type': 'status', 'message': 'Routing complete.'})}\n\n"
+        yield f"data: {json.dumps({'type': 'token', 'chunk': ans})}\n\n"
+        yield f"data: {json.dumps({'type': 'complete', 'final_answer': ans, 'trace': trace})}\n\n"
+        return
+
+    # Helper function to run the threads
+    def _run_plan():
+        if plan.mode == "single":
+            _run_one_step_stream(plan.steps[0].workflow_id, plan.steps[0].subprompt, session_id, q)
+            
+        elif plan.mode == "sequential":
+            # Simplified sequential for brevity - runs sequentially and pushes to queue
+            prev_answer = ""
+            for step in plan.steps:
+                composed = step.subprompt if not prev_answer else f"Prior Context:\n{prev_answer}\n\nNow: {step.subprompt}"
+                _run_one_step_stream(step.workflow_id, composed, session_id, q)
+                # We would extract the answer from the step_complete event to feed the next step
+
+        elif plan.mode == "parallel":
+            q.put({"type": "status", "message": f"Dispatching {len(plan.steps)} parallel agents..."})
+            with ThreadPoolExecutor(max_workers=len(plan.steps)) as pool:
+                futures = [pool.submit(_run_one_step_stream, step.workflow_id, step.subprompt, session_id, q) for step in plan.steps]
+                for fut in as_completed(futures):
+                    pass # Threads will automatically put their results in the queue
+
+        q.put({"type": "plan_finished"})
+
+    # Start execution in a background thread so the main thread can yield to the HTTP response
+    threading.Thread(target=_run_plan, daemon=True).start()
+
+    final_parts = []
+    completed_steps = 0
+    total_steps = len(plan.steps)
+
+    while True:
+        event = q.get()
+        if event["type"] == "plan_finished":
+            break
+        
+        if event["type"] == "step_complete":
+            trace.extend(event["trace"])
+            final_parts.append((event["workflow_id"], event["answer"]))
+            completed_steps += 1
+            if completed_steps < total_steps:
+                 continue # Wait for other parallel steps
+                 
+        # Yield the real-time event to the frontend
+        yield f"data: {json.dumps(event)}\n\n"
+
+    ### Change for SSE
+
+    # # Merge parallel/sequential answers if needed
+    # yield f"data: {json.dumps({'type': 'status', 'message': 'Synthesizing final report...'})}\n\n"
+    # final_merged = _merge_answers(original_prompt, final_parts)
+    # yield f"data: {json.dumps({'type': 'token', 'chunk': final_merged})}\n\n"
+    
+    # yield f"data: {json.dumps({'type': 'complete', 'final_answer': final_merged, 'trace': trace})}\n\n"
+    # ONLY merge and yield a final chunk if we actually ran multiple workflows
+    if plan.mode in ("sequential", "parallel") and len(final_parts) > 1:
+        yield f"data: {json.dumps({'type': 'status', 'message': 'Synthesizing final report...'})}\n\n"
+        final_merged = _merge_answers(original_prompt, final_parts)
+        
+        # Yield the merged text so the UI prints it
+        yield f"data: {json.dumps({'type': 'token', 'chunk': '\n\n' + final_merged})}\n\n"
+    else:
+        # In single mode, the LangGraph agent ALREADY streamed the text to the UI token-by-token!
+        # We just extract the string here so we can pass it to Episodic Memory in the background.
+        final_merged = final_parts[0][1] if final_parts else "No response generated."
+    
+    # Send the completion event (without appending more tokens to the screen)
+    yield f"data: {json.dumps({'type': 'complete', 'final_answer': final_merged, 'trace': trace})}\n\n"
+
+    ### End Change for SSE
+
+
+## Change SSE 2 End

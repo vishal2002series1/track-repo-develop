@@ -2,6 +2,9 @@
 import streamlit as st
 import requests
 import pandas as pd
+import json
+import requests
+import streamlit as st
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Aeon Agent Factory", layout="wide")
@@ -284,6 +287,8 @@ elif page == "Playground":
 # ==========================================
 # 💬 PAGE 5: EXECUTION CHAT
 # ==========================================
+
+### Change it entirely to accomodate SSE 
 elif page == "Execution Chat":
     st.title("LangGraph Chat Execution")
 
@@ -325,44 +330,71 @@ elif page == "Execution Chat":
                 st.write(prompt)
 
             is_auto = selected_wf["id"] == "__auto__"
-            spinner_msg = (
-                "🤖 Router planning and executing..."
-                if is_auto
-                else "Executing Workflow Graph..."
-            )
 
-            with st.spinner(spinner_msg):
-                payload = {
-                    "prompt": prompt,
-                    "session_id": session_id if session_id else None,
-                }
-                # In Auto mode, omit workflow_id so the backend router decides.
-                if not is_auto:
-                    payload["workflow_id"] = selected_wf["id"]
-                # Pass identity through only if filled in.
-                if user_id.strip():
-                    payload["user_id"] = user_id.strip()
-                if tenant_id.strip():
-                    payload["tenant_id"] = tenant_id.strip()
+            # 1. Build the payload exactly as before
+            payload = {
+                "prompt": prompt,
+                "session_id": session_id if session_id else None,
+            }
+            if not is_auto:
+                payload["workflow_id"] = selected_wf["id"]
+            if user_id.strip():
+                payload["user_id"] = user_id.strip()
+            if tenant_id.strip():
+                payload["tenant_id"] = tenant_id.strip()
 
-                res = post_data("chat", payload)
+            # 2. Replace st.spinner with the new Streaming UI block
+            with st.chat_message("ai"):
+                # Placeholders for the live UI updates
+                status_text = st.empty()       
+                message_placeholder = st.empty() 
+                
+                full_response = ""
+                execution_trace = []
 
-                if res:
-                    with st.chat_message("ai"):
-                        st.write(res.get("final_answer", ""))
+                try:
+                    # 3. Call the API with stream=True
+                    # Note: Adjust the base URL if your FastAPI is hosted on a different port/IP
+                    response = requests.post(
+                        "http://127.0.0.1:8000/api/chat",
+                        json=payload,
+                        stream=True 
+                    )
 
-                        # 🆕 Show the router's plan (only present in auto mode)
-                        routed_plan = res.get("routed_plan")
-                        execution_trace = res.get("execution_trace")
+                    response.raise_for_status()
 
-                        if routed_plan or execution_trace:
-                            with st.expander("🔍 Graph Trace / Router Plan"):
-                                if routed_plan:
-                                    st.markdown("**🤖 Router Plan**")
-                                    st.json(routed_plan)
-                                    st.markdown("---")
-                                if execution_trace:
-                                    st.markdown("**Execution Trace**")
-                                    st.json(execution_trace)
+                    # 4. Iterate over the incoming Server-Sent Events (SSE)
+                    for line in response.iter_lines():
+                        if line:
+                            decoded_line = line.decode('utf-8')
+                            
+                            if decoded_line.startswith("data: "):
+                                event_data = json.loads(decoded_line[6:])
+                                event_type = event_data.get("type")
+                                
+                                # Handle Real-time Status Updates (Tools, Routing decisions)
+                                if event_type == "status":
+                                    status_text.caption(f"🔄 {event_data.get('message')}")
+                                    
+                                # Handle Token Streaming (Typing effect)
+                                elif event_type == "token":
+                                    full_response += event_data.get("chunk", "")
+                                    message_placeholder.markdown(full_response + " ▌")
+                                    
+                                # Handle Completion
+                                elif event_type == "complete":
+                                    message_placeholder.markdown(full_response)
+                                    status_text.empty() # Remove the loading text
+                                    execution_trace = event_data.get("trace", [])
+
+                    # 5. Show the Execution Trace in an expander after the stream finishes
+                    if execution_trace:
+                        with st.expander("🔍 Graph Trace / Router Plan"):
+                            st.markdown("**Execution Trace**")
+                            st.json(execution_trace)
+
+                except Exception as e:
+                    st.error(f"Failed to communicate with the backend stream: {e}")
+
     else:
         st.warning("Please create a workflow in the Workflow Manager first.")
