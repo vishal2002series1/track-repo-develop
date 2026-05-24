@@ -135,23 +135,18 @@ def get_llm():
 # --- Helper Function: Flatten History ---
 def extract_clean_history(messages):
     """
-    Extracts a clean, text-only representation of the conversation history
-    for the synthesizer. Includes:
-      - The user's original question (always first)
-      - AI prose responses (even from intermediate ReAct steps)
-      - Tool results as structured data blocks
+    Extracts a clean, text-only representation of the conversation history,
+    ignoring tool calls and intermediate routing steps.
     """
     history_text = ""
     for msg in messages:
         if isinstance(msg, HumanMessage):
-            history_text += f"USER: {msg.content}\n\n"
-        elif isinstance(msg, AIMessage):
-            # Include AI content whether or not it has tool_calls.
-            # ReAct agents often emit content="" on tool-calling steps — skip those.
-            if msg.content and str(msg.content).strip():
-                history_text += f"ASSISTANT: {msg.content}\n\n"
+             history_text += f"USER: {msg.content}\n\n"
+        elif isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+             history_text += f"ASSISTANT: {msg.content}\n\n"
         elif isinstance(msg, ToolMessage):
-            history_text += f"TOOL DATA: {msg.content}\n\n"
+            history_text += f"TOOL DATA: {msg.content}\n\n" ## Change 
+            #  history_text += f"[Tool Result Data Available]\n\n"
     return history_text
 
 # --- 3. Dynamic Worker Node Generator ---
@@ -226,17 +221,14 @@ CRITICAL UI FORMATTING RULE:
 When the user asks for a chart, graph, or visual representation, you MUST output data using the
 exact markdown block below. Do NOT describe charts in prose paragraphs.
 
-Supported chart_type values and when to use them:
-- "donut"     → single-series percentage/proportion breakdown (e.g. allocation by asset class)
-- "pie"       → same as donut but without a hole
-- "bar"       → comparing discrete categories (labels = category names, values = amounts)
-- "line"      → trend over time (labels = dates/periods, values = numeric series)
-- "scatter"   → two continuous numeric dimensions, one per client/entity
-                 Use keys: "x" (list of x-values), "y" (list of y-values), "labels" (point names)
-- "area"      → filled line chart for cumulative/stacked trends
-- "table"     → raw tabular data; use keys "columns" (list) and "rows" (list of lists)
+Supported chart_type values:
+- "donut" / "pie" → proportion breakdown
+- "bar"           → comparing categories (labels + values)
+- "scatter"       → two numeric axes; use "x", "y", "labels" keys
+- "line" / "area" → trend over time
+- "table"         → tabular data; use "columns" and "rows" keys
 
-Format for donut / pie / bar / line / area:
+Example (bar):
 ```json:widget
 {
   "chart_type": "bar",
@@ -246,33 +238,10 @@ Format for donut / pie / bar / line / area:
 }
 ```
 
-Format for scatter (IMPORTANT — use x/y/labels, NOT labels/values):
-```json:widget
-{
-  "chart_type": "scatter",
-  "title": "Portfolio Value vs Equity Exposure",
-  "labels": ["Client A", "Client B", "Client C"],
-  "x": [1200000, 850000, 3100000],
-  "y": [42.5, 31.0, 67.8],
-  "x_label": "Portfolio Value ($)",
-  "y_label": "Equity Exposure (%)"
-}
-```
-
-Format for table:
-```json:widget
-{
-  "chart_type": "table",
-  "title": "Client Summary",
-  "columns": ["Name", "Portfolio Value", "Equity %"],
-  "rows": [["Alice", 1200000, 42.5], ["Bob", 850000, 31.0]]
-}
-```
-
 CRITICAL RULES:
-- Output ONLY the markdown block(s) — no surrounding prose description of the chart itself.
-- You MAY output a brief text summary BEFORE the block, then the block.
-- Multiple charts in one response are allowed — just output multiple blocks sequentially.
+- Output ONLY the markdown block(s) — no surrounding prose description of the chart.
+- You MAY output a brief text summary BEFORE the block.
+- Multiple charts are allowed — output multiple blocks sequentially.
 - Never output raw SSE syntax (data: {...}).
 """
 
@@ -308,34 +277,29 @@ CRITICAL RULES:
         """Formats the final response beautifully for the user."""
         llm = get_llm()
         clean_history = extract_clean_history(state["messages"])
-                
-        # Use SystemMessage + HumanMessage directly to avoid LangChain parsing
-        # the {JSON} examples inside active_synthesizer_persona as template variables.
+
+        # Use SystemMessage + HumanMessage directly — NOT ChatPromptTemplate.
+        # ChatPromptTemplate parses {json_keys} inside active_synthesizer_persona
+        # as template variables, which crashes on the widget JSON examples.
         from langchain_core.messages import SystemMessage as _SystemMessage
         human_text = (
-            "Here is the full conversation history including tool data collected by worker agents:\n\n"
+            "Here is the conversation history and data collected so far:\n\n"
             f"{clean_history}\n\n"
-            "The USER's question is at the top of the history above (marked 'USER:').\n"
-            "The TOOL DATA sections contain raw query results that answer the question.\n\n"
-            "Your job: synthesize a complete, well-formatted response to the user's question "
-            "using the tool data. If the question asks for a chart or graph, output a json:widget "
-            "block as instructed in your system prompt. Do NOT say the data is unavailable — "
-            "it is in the TOOL DATA above."
+            "Please synthesize the final answer."
         )
         result = llm.invoke(
             [_SystemMessage(content=active_synthesizer_persona), HumanMessage(content=human_text)],
             config=config,
         )
-        
         return {"messages": [result]}
         
     
     
         
-    # Append the dynamic rules instead of hardcoded strings
-    # system_prompt += active_supervisor_rules
-    print(f"🔍 [SYSTEM PROMPT LENGTH]: {len(system_prompt)}")
-    print(f"🔍 [SYSTEM PROMPT TAIL]:\n{system_prompt[-500:]}")
+    # NOTE: active_supervisor_rules is already embedded in system_prompt above.
+    # DO NOT append again here — doing so doubles the prompt and causes the
+    # supervisor LLM to route to synthesizer on every fresh question.
+
     ## Change 4: Parallel : # 👈 CHANGED: Dynamic Pydantic schema expects a list
 
     class Route(BaseModel):
@@ -350,23 +314,53 @@ CRITICAL RULES:
     def supervisor_node(state: AgentState):
         llm = get_llm()
         
-        clean_history = extract_clean_history(state["messages"])
-
-        # TEMPORARY DEBUG
-        print(f"🔍 [SUPERVISOR DEBUG] Messages in state: {len(state['messages'])}")
-        print(f"🔍 [SUPERVISOR DEBUG] History passed to supervisor:\n{clean_history}")
+        messages_list = list(state["messages"])
+        clean_history = extract_clean_history(messages_list)
+        
+        # Detect whether any data-retrieval activity has happened in this turn.
+        has_tool_data = any(isinstance(m, ToolMessage) for m in messages_list)
+        has_agent_response = any(
+            isinstance(m, AIMessage) and m.content and str(m.content).strip()
+            for m in messages_list
+        )
+        data_already_retrieved = has_tool_data or has_agent_response
+        
+        # Pull the latest user question for clarity.
+        latest_user_question = ""
+        for m in reversed(messages_list):
+            if isinstance(m, HumanMessage):
+                latest_user_question = m.content
+                break
+        
+        agent_only_options = [o for o in options if o != "synthesizer"]
+        
+        # Neutral guidance — no override/forbid/jailbreak-sounding language.
+        if not data_already_retrieved:
+            routing_hint = (
+                f"\n\nCurrent state: no tool results are present in the conversation yet. "
+                f"A data-retrieval agent needs to run first before the synthesizer can produce an answer. "
+                f"Available agents for this step: {agent_only_options}. "
+                f"Please pick the agent best suited to the user's question."
+            )
+        else:
+            routing_hint = (
+                f"\n\nCurrent state: tool results are already present in the conversation. "
+                f"If those results fully answer the user's question, choose 'synthesizer'. "
+                f"If more data is needed, pick the next appropriate agent. "
+                f"Available choices: {options}."
+            )
         
         from langchain_core.messages import SystemMessage as _SystemMessage
         supervisor_result = llm.with_structured_output(Route).invoke([
             _SystemMessage(content=system_prompt),
             HumanMessage(content=(
-                f"Here is the conversation history:\n\n{clean_history}\n\n"
-                f"Based on the history and the latest user request, who should act next? "
-                f"Select one or more from: {options}"
+                f"Latest user question:\n{latest_user_question}\n\n"
+                f"Conversation so far:\n{clean_history}"
+                f"{routing_hint}"
             ))
         ])
         
-        print(f"🔗 [SUPERVISOR] Routing to: {supervisor_result.next}")
+        print(f"🔗 [SUPERVISOR] data_already_retrieved={data_already_retrieved} → Routing to: {supervisor_result.next}")
         return {"next": supervisor_result.next}
 
     ## Change 4: End
