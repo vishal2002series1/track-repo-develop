@@ -267,7 +267,7 @@ def _run_one_step(
     db = SessionLocal()
     try:
         graph = build_dynamic_graph(workflow_id, db)
-        thread_id = f"{session_id}::{workflow_id}"
+        thread_id = f"{session_id}::{workflow_id}::{int(time.time())}" ## Change for better traceability in concurrent runs
         config = {"configurable": {"thread_id": thread_id}}
         inputs = {"messages": [HumanMessage(content=composed_prompt)]}
 
@@ -390,7 +390,7 @@ def _run_one_step_stream(
     db = SessionLocal()
     try:
         graph = build_dynamic_graph(workflow_id, db)
-        thread_id = f"{session_id}::{workflow_id}"
+        thread_id = f"{session_id}::{workflow_id}::{int(time.time())}" ## Change for better traceability in concurrent runs
         config = {"configurable": {"thread_id": thread_id}}
         inputs = {"messages": [HumanMessage(content=composed_prompt)]}
 

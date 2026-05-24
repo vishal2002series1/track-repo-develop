@@ -5,6 +5,125 @@ import pandas as pd
 import json
 import requests
 import streamlit as st
+import re
+
+## Change for Showing Graphs in Streamlit
+
+import plotly.express as px
+import plotly.graph_objects as go
+
+# ---------------------------------------------------------------------------
+# WIDGET RENDERER — parses ```json:widget blocks and renders Plotly charts.
+# Supports multiple widgets in a single response.
+# Supported chart_types: donut, pie, bar, line, scatter, area, histogram, table
+# ---------------------------------------------------------------------------
+WIDGET_PATTERN = re.compile(r"```json:widget\s*(\{.*?\})\s*```", re.DOTALL)
+
+def _render_single_widget(spec: dict):
+    """Render one widget spec dict as a Streamlit Plotly chart."""
+    chart_type = spec.get("chart_type", "").lower()
+    title      = spec.get("title", "")
+    labels     = spec.get("labels", [])
+    values     = spec.get("values", [])
+    # For scatter/line/bar: explicit x/y keys take priority; fall back to labels/values
+    x          = spec.get("x") if spec.get("x") is not None else labels
+    y          = spec.get("y") if spec.get("y") is not None else values
+
+    try:
+        if chart_type in ("donut", "pie"):
+            hole = 0.45 if chart_type == "donut" else 0.0
+            fig = go.Figure(go.Pie(labels=labels, values=values, hole=hole,
+                                   textinfo="label+percent", hoverinfo="label+value+percent"))
+            fig.update_layout(title_text=title, showlegend=True)
+
+        elif chart_type == "bar":
+            fig = px.bar(x=x, y=y, labels={"x": spec.get("x_label",""), "y": spec.get("y_label","")},
+                         title=title, text_auto=True)
+
+        elif chart_type == "line":
+            fig = px.line(x=x, y=y, labels={"x": spec.get("x_label",""), "y": spec.get("y_label","")},
+                          title=title, markers=True)
+
+        elif chart_type == "area":
+            fig = px.area(x=x, y=y, labels={"x": spec.get("x_label",""), "y": spec.get("y_label","")},
+                          title=title)
+
+        elif chart_type == "scatter":
+            point_labels = spec.get("labels", [])
+            fig = px.scatter(
+                x=x, y=y,
+                text=point_labels if point_labels else None,
+                labels={"x": spec.get("x_label", "X"), "y": spec.get("y_label", "Y")},
+                title=title
+            )
+            if point_labels:
+                fig.update_traces(textposition="top center")
+
+        elif chart_type == "histogram":
+            fig = px.histogram(x=x if x else values, nbins=spec.get("bins", 20), title=title)
+
+        elif chart_type == "table":
+            # spec: {"chart_type":"table","title":"...","columns":["A","B"],"rows":[[1,2],[3,4]]}
+            columns = spec.get("columns", labels)
+            rows    = spec.get("rows", [])
+            if rows:
+                fig = go.Figure(go.Table(
+                    header=dict(values=columns, fill_color="#0078D4", font=dict(color="white")),
+                    cells=dict(values=list(zip(*rows)) if rows else [])
+                ))
+                fig.update_layout(title_text=title)
+            else:
+                st.warning(f"Table widget '{title}' has no rows.")
+                return
+        else:
+            st.warning(f"Unknown chart_type '{chart_type}' — skipping widget.")
+            return
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Failed to render widget '{title}': {e}")
+
+
+def render_response_with_widgets(container, text: str, streaming: bool = False):
+    """
+    Splits `text` into prose and ```json:widget blocks.
+    Prose is written to `container` (supports markdown + source badges).
+    Each widget block is rendered as a Plotly chart beneath the prose.
+    
+    When streaming=True a cursor ▌ is appended to the prose preview and
+    widgets are NOT rendered yet (incomplete JSON mid-stream is skipped).
+    """
+    # Apply source badge styling to prose
+    def _badge(t):
+        return re.sub(
+            r"\[Source:\s*(.*?)\]",
+            r" <span title='Reference data available below' style='color:#0078D4;"
+            r"font-size:0.85em;background-color:#F3F2F1;padding:2px 6px;"
+            r"border-radius:4px;cursor:help;border:1px solid #c8e0f4;'>🔍 \1</span> ",
+            t
+        )
+
+    # Split on widget blocks
+    parts    = WIDGET_PATTERN.split(text)   # [prose, json, prose, json, ...]
+    prose_parts = parts[0::2]               # even indices → text
+    json_parts  = parts[1::2]               # odd  indices → raw JSON strings
+
+    # Combine all prose for the main placeholder
+    full_prose = "".join(prose_parts).strip()
+    cursor     = " ▌" if streaming else ""
+    if full_prose or streaming:
+        container.markdown(_badge(full_prose) + cursor, unsafe_allow_html=True)
+
+    # Render widgets (only when not streaming — JSON may be incomplete mid-stream)
+    if not streaming:
+        for raw_json in json_parts:
+            try:
+                spec = json.loads(raw_json)
+                _render_single_widget(spec)
+            except json.JSONDecodeError:
+                st.warning("Could not parse widget JSON — skipping.")
+
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Aeon Agent Factory", layout="wide")
@@ -322,7 +441,10 @@ elif page == "Execution Chat":
             if history and history.get("messages"):
                 for msg in history["messages"]:
                     with st.chat_message(msg["role"]):
-                        st.write(msg["content"])
+                        if msg["role"] == "ai":
+                            render_response_with_widgets(st, msg["content"], streaming=False)
+                        else:
+                            st.write(msg["content"])
 
         # Chat Input
         if prompt := st.chat_input("Send a message to the workflow..."):
@@ -375,17 +497,43 @@ elif page == "Execution Chat":
                                 # Handle Real-time Status Updates (Tools, Routing decisions)
                                 if event_type == "status":
                                     status_text.caption(f"🔄 {event_data.get('message')}")
+                                
+                                ### Change : Pertaining to citations and graphs
                                     
-                                # Handle Token Streaming (Typing effect)
+                                # # Handle Token Streaming (Typing effect)
+                                # elif event_type == "token":
+                                #     full_response += event_data.get("chunk", "")
+                                #     message_placeholder.markdown(full_response + " ▌")
+                                
+                                
+
                                 elif event_type == "token":
                                     full_response += event_data.get("chunk", "")
-                                    message_placeholder.markdown(full_response + " ▌")
+                                    # Stream prose only; skip widget rendering mid-stream
+                                    render_response_with_widgets(message_placeholder, full_response, streaming=True)
                                     
-                                # Handle Completion
                                 elif event_type == "complete":
-                                    message_placeholder.markdown(full_response)
-                                    status_text.empty() # Remove the loading text
+                                    # 🛠️ FIX: Fallback to the backend's final_answer if the stream dropped
+                                    final_text = event_data.get("final_answer") or full_response
+                                    # Render prose + all widgets now that the full response is available
+                                    render_response_with_widgets(message_placeholder, final_text, streaming=False)
+                                    status_text.empty()
                                     execution_trace = event_data.get("trace", [])
+                                    
+                                # 🛠️ NEW: Catch backend errors so the UI tells you what went wrong!
+                                elif event_type == "error":
+                                    st.error(f"Backend Error: {event_data.get('message')}")
+                                    status_text.empty()
+
+                                    
+                                # # Handle Completion
+                                # elif event_type == "complete":
+                                #     message_placeholder.markdown(full_response)
+                                #     status_text.empty() # Remove the loading text
+                                #     execution_trace = event_data.get("trace", [])
+
+                                ## Change : End
+                                
 
                     # 5. Show the Execution Trace in an expander after the stream finishes
                     if execution_trace:

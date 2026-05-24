@@ -390,36 +390,25 @@ def unmap_agent_from_workflow(workflow_id: str, agent_id: str, db: Session = Dep
     return {"message": "Agent was not mapped to this workflow."}
 
 # --- 🧠 MEMORY & EXECUTION ENDPOINTS ---
-@app.get("/api/sessions/{thread_id}/history", tags=["Execution"])
+@app.get("/api/sessions/{thread_id}/history", tags=["Execution"]) ### Change for an efffective episodic memory
 def get_chat_history(thread_id: str):
-    """Retrieve the conversation history for a specific thread from the LangGraph Checkpointer."""
-    config = {"configurable": {"thread_id": thread_id}}
-    
     try:
-        # Fetch the thread state from the checkpointer
-        state_tuple = workflow_memory.get(config)
-        
-        if not state_tuple:
-            return {"thread_id": thread_id, "messages": []}
-            
-        # Extract messages from the state 
-        state_data = state_tuple.channel_values if hasattr(state_tuple, 'channel_values') else state_tuple
-        messages = state_data.get("messages", [])
-        
-        # Format them for the UI
+        turns = episodic_memory.recent(session_id=thread_id, k=20)
         formatted_history = []
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                formatted_history.append({"role": "user", "content": msg.content})
-            elif isinstance(msg, AIMessage) and msg.content:
-                formatted_history.append({"role": "ai", "content": msg.content})
-            elif isinstance(msg, ToolMessage):
-                formatted_history.append({"role": "tool", "content": f"[System: Executed tool '{msg.name}']"})
-                
-        return {
-            "thread_id": thread_id,
-            "messages": formatted_history
-        }
+        for turn in reversed(turns):
+            doc = turn.get("document", "")
+            if "\n---\n" in doc:
+                user_part, ai_part = doc.split("\n---\n", 1)
+                user_text = user_part.replace("USER: ", "", 1).strip()
+                ai_text = ai_part.replace("AI Answer: ", "", 1).strip()
+            else:
+                user_text = doc.strip()
+                ai_text = ""
+            if user_text:
+                formatted_history.append({"role": "user", "content": user_text})
+            if ai_text:
+                formatted_history.append({"role": "ai", "content": ai_text})
+        return {"thread_id": thread_id, "messages": formatted_history}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading history: {str(e)}")
 
@@ -552,6 +541,9 @@ def execute_chat_workflow(
                     user_id=request.user_id,
                     tenant_id=request.tenant_id or "default",
                 )
+
+                print(f"🔍 [PLANNER] Selected workflow: {[s.workflow_id for s in plan.steps]}")
+                print(f"🔍 [PLANNER] Subprompt: {[s.subprompt for s in plan.steps]}")
                 
                 # Instantly tell the frontend what the Router decided!
                 yield f"data: {json.dumps({'type': 'status', 'message': f'Router chose {plan.mode} mode with confidence: {plan.confidence}'})}\n\n"

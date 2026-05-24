@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field  ## Change 2: Parallel : added Field
 # AZURE MIGRATION: Swap Bedrock for Azure OpenAI
 from langchain_openai import AzureChatOpenAI
 
+from langchain_core.runnables import RunnableConfig
+
 from sqlalchemy.orm import Session
 from src.db.database import SessionLocal
 from src.db.models import Workflow
@@ -126,23 +128,30 @@ def get_llm():
         api_version=api_version,
         azure_deployment=deployment_name,
         temperature=0.0,
-        max_tokens=8000
+        max_tokens=8000,
+        streaming=True  ### Change : Parallel : Enable streaming for real-time token updates
     )
 
 # --- Helper Function: Flatten History ---
 def extract_clean_history(messages):
     """
-    Extracts a clean, text-only representation of the conversation history,
-    ignoring tool calls and intermediate routing steps.
+    Extracts a clean, text-only representation of the conversation history
+    for the synthesizer. Includes:
+      - The user's original question (always first)
+      - AI prose responses (even from intermediate ReAct steps)
+      - Tool results as structured data blocks
     """
     history_text = ""
     for msg in messages:
         if isinstance(msg, HumanMessage):
-             history_text += f"USER: {msg.content}\n\n"
-        elif isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
-             history_text += f"ASSISTANT: {msg.content}\n\n"
+            history_text += f"USER: {msg.content}\n\n"
+        elif isinstance(msg, AIMessage):
+            # Include AI content whether or not it has tool_calls.
+            # ReAct agents often emit content="" on tool-calling steps — skip those.
+            if msg.content and str(msg.content).strip():
+                history_text += f"ASSISTANT: {msg.content}\n\n"
         elif isinstance(msg, ToolMessage):
-             history_text += f"[Tool Result Data Available]\n\n"
+            history_text += f"TOOL DATA: {msg.content}\n\n"
     return history_text
 
 # --- 3. Dynamic Worker Node Generator ---
@@ -192,6 +201,93 @@ def build_dynamic_graph(workflow_id: str, db: Session):
     active_supervisor_rules = custom_sup.strip() if custom_sup and custom_sup.strip() else prompts.get("supervisor_rules", "")
     active_synthesizer_persona = custom_syn.strip() if custom_syn and custom_syn.strip() else prompts.get("synthesizer_persona", "You are a helpful assistant.")
 
+    # UNIVERSAL_WIDGET_RULE = """
+    # CRITICAL UI FORMATTING RULE:
+    # When the user asks for a chart, graph, or visual representation, DO NOT describe it in text paragraphs.
+    # You MUST output your data using this EXACT markdown code block format:
+    # ```json:widget
+    # {
+    # "chart_type": "donut",
+    # "title": "Title Here",
+    # "labels": ["A", "B", "C"],
+    # "values": [10, 20, 30]
+    # }
+    # ```
+    # CRITICAL RULES:
+    # NEVER output raw streaming syntax like data: {"type": ....
+    # ONLY use the markdown block exactly as shown above.
+    # Supported chart_types are "donut" and "bar".
+    # """
+
+    
+    # active_synthesizer_persona += "\n" + UNIVERSAL_WIDGET_RULE
+    UNIVERSAL_WIDGET_RULE = r"""
+CRITICAL UI FORMATTING RULE:
+When the user asks for a chart, graph, or visual representation, you MUST output data using the
+exact markdown block below. Do NOT describe charts in prose paragraphs.
+
+Supported chart_type values and when to use them:
+- "donut"     → single-series percentage/proportion breakdown (e.g. allocation by asset class)
+- "pie"       → same as donut but without a hole
+- "bar"       → comparing discrete categories (labels = category names, values = amounts)
+- "line"      → trend over time (labels = dates/periods, values = numeric series)
+- "scatter"   → two continuous numeric dimensions, one per client/entity
+                 Use keys: "x" (list of x-values), "y" (list of y-values), "labels" (point names)
+- "area"      → filled line chart for cumulative/stacked trends
+- "table"     → raw tabular data; use keys "columns" (list) and "rows" (list of lists)
+
+Format for donut / pie / bar / line / area:
+```json:widget
+{
+  "chart_type": "bar",
+  "title": "Title Here",
+  "labels": ["A", "B", "C"],
+  "values": [10, 20, 30]
+}
+```
+
+Format for scatter (IMPORTANT — use x/y/labels, NOT labels/values):
+```json:widget
+{
+  "chart_type": "scatter",
+  "title": "Portfolio Value vs Equity Exposure",
+  "labels": ["Client A", "Client B", "Client C"],
+  "x": [1200000, 850000, 3100000],
+  "y": [42.5, 31.0, 67.8],
+  "x_label": "Portfolio Value ($)",
+  "y_label": "Equity Exposure (%)"
+}
+```
+
+Format for table:
+```json:widget
+{
+  "chart_type": "table",
+  "title": "Client Summary",
+  "columns": ["Name", "Portfolio Value", "Equity %"],
+  "rows": [["Alice", 1200000, 42.5], ["Bob", 850000, 31.0]]
+}
+```
+
+CRITICAL RULES:
+- Output ONLY the markdown block(s) — no surrounding prose description of the chart itself.
+- You MAY output a brief text summary BEFORE the block, then the block.
+- Multiple charts in one response are allowed — just output multiple blocks sequentially.
+- Never output raw SSE syntax (data: {...}).
+"""
+
+    GLOBAL_TRUST_RULE = """
+    CRITICAL RULE - CITATIONS:
+    Whenever you state a specific fact, metric, date, or detail retrieved by a worker agent, you MUST cite the source inline. 
+    Format your citations strictly like this: [Source: TableName] or [Source: DocumentName].
+    Example: "Jonathan has an AUM of $47.10M [Source: PortfolioData]."
+    Never invent a source. If you don't know where the data came from, do not add a citation.
+    """
+    # active_synthesizer_persona += "\n" + GLOBAL_TRUST_RULE
+
+    # Append BOTH rules
+    active_synthesizer_persona += "\n" + UNIVERSAL_WIDGET_RULE + "\n" + GLOBAL_TRUST_RULE
+
     # 👈 Fixed: Define agent_descriptions BEFORE using it
     agent_descriptions = "\n".join([f"- {agent.id}: {agent.routing_description}" for agent in agents])
     
@@ -206,19 +302,30 @@ def build_dynamic_graph(workflow_id: str, db: Session):
     """
 
     # --- NEW: Synthesizer Node (Moved INSIDE so it can read active_synthesizer_persona) ---
-    def synthesizer_node(state: AgentState):
+
+    ## Change 
+    def synthesizer_node(state: AgentState, config: RunnableConfig):
         """Formats the final response beautifully for the user."""
         llm = get_llm()
         clean_history = extract_clean_history(state["messages"])
                 
-        # 🟢 Modified to use active_synthesizer_persona
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", active_synthesizer_persona),
-            ("human", "Here is the conversation history and data collected so far:\n\n{history}\n\nPlease synthesize the final answer.")
-        ])
-        
-        chain = prompt | llm
-        result = chain.invoke({"history": clean_history})
+        # Use SystemMessage + HumanMessage directly to avoid LangChain parsing
+        # the {JSON} examples inside active_synthesizer_persona as template variables.
+        from langchain_core.messages import SystemMessage as _SystemMessage
+        human_text = (
+            "Here is the full conversation history including tool data collected by worker agents:\n\n"
+            f"{clean_history}\n\n"
+            "The USER's question is at the top of the history above (marked 'USER:').\n"
+            "The TOOL DATA sections contain raw query results that answer the question.\n\n"
+            "Your job: synthesize a complete, well-formatted response to the user's question "
+            "using the tool data. If the question asks for a chart or graph, output a json:widget "
+            "block as instructed in your system prompt. Do NOT say the data is unavailable — "
+            "it is in the TOOL DATA above."
+        )
+        result = llm.invoke(
+            [_SystemMessage(content=active_synthesizer_persona), HumanMessage(content=human_text)],
+            config=config,
+        )
         
         return {"messages": [result]}
         
@@ -226,8 +333,9 @@ def build_dynamic_graph(workflow_id: str, db: Session):
     
         
     # Append the dynamic rules instead of hardcoded strings
-    system_prompt += active_supervisor_rules
-
+    # system_prompt += active_supervisor_rules
+    print(f"🔍 [SYSTEM PROMPT LENGTH]: {len(system_prompt)}")
+    print(f"🔍 [SYSTEM PROMPT TAIL]:\n{system_prompt[-500:]}")
     ## Change 4: Parallel : # 👈 CHANGED: Dynamic Pydantic schema expects a list
 
     class Route(BaseModel):
@@ -243,17 +351,23 @@ def build_dynamic_graph(workflow_id: str, db: Session):
         llm = get_llm()
         
         clean_history = extract_clean_history(state["messages"])
+
+        # TEMPORARY DEBUG
+        print(f"🔍 [SUPERVISOR DEBUG] Messages in state: {len(state['messages'])}")
+        print(f"🔍 [SUPERVISOR DEBUG] History passed to supervisor:\n{clean_history}")
         
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("human", "Here is the conversation history:\n\n{history}\n\nBased on the history and the latest user request, who should act next? Select one or more from: {options}")
-        ]).partial(options=str(options))
+        from langchain_core.messages import SystemMessage as _SystemMessage
+        supervisor_result = llm.with_structured_output(Route).invoke([
+            _SystemMessage(content=system_prompt),
+            HumanMessage(content=(
+                f"Here is the conversation history:\n\n{clean_history}\n\n"
+                f"Based on the history and the latest user request, who should act next? "
+                f"Select one or more from: {options}"
+            ))
+        ])
         
-        supervisor_chain = prompt | llm.with_structured_output(Route)
-        result = supervisor_chain.invoke({"history": clean_history})
-        
-        print(f"🔗 [SUPERVISOR] Routing to: {result.next}")
-        return {"next": result.next} # 👈 Returns a list like ["agent_1", "agent_2"]
+        print(f"🔗 [SUPERVISOR] Routing to: {supervisor_result.next}")
+        return {"next": supervisor_result.next}
 
     ## Change 4: End
 
