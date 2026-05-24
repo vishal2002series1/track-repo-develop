@@ -13,11 +13,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # ---------------------------------------------------------------------------
-# WIDGET RENDERER — parses ```json:widget blocks and renders Plotly charts.
-# Supports multiple widgets in a single response.
-# Supported chart_types: donut, pie, bar, line, scatter, area, histogram, table
+# WIDGET RENDERER — parses ```json:widget and ```json:suggestions blocks
+# Supports multiple widgets and a single suggestions block in one response.
 # ---------------------------------------------------------------------------
 WIDGET_PATTERN = re.compile(r"```json:widget\s*(\{.*?\})\s*```", re.DOTALL)
+SUGGESTIONS_PATTERN = re.compile(r"```json:suggestions\s*(\{.*?\})\s*```", re.DOTALL)
+CITATION_PATTERN = re.compile(r"\[(\d+)\]")
+
 
 def _render_single_widget(spec: dict):
     """Render one widget spec dict as a Streamlit Plotly chart."""
@@ -25,7 +27,6 @@ def _render_single_widget(spec: dict):
     title      = spec.get("title", "")
     labels     = spec.get("labels", [])
     values     = spec.get("values", [])
-    # For scatter/line/bar: explicit x/y keys take priority; fall back to labels/values
     x          = spec.get("x") if spec.get("x") is not None else labels
     y          = spec.get("y") if spec.get("y") is not None else values
 
@@ -63,7 +64,6 @@ def _render_single_widget(spec: dict):
             fig = px.histogram(x=x if x else values, nbins=spec.get("bins", 20), title=title)
 
         elif chart_type == "table":
-            # spec: {"chart_type":"table","title":"...","columns":["A","B"],"rows":[[1,2],[3,4]]}
             columns = spec.get("columns", labels)
             rows    = spec.get("rows", [])
             if rows:
@@ -85,37 +85,50 @@ def _render_single_widget(spec: dict):
         st.error(f"Failed to render widget '{title}': {e}")
 
 
+def _style_citations(text: str) -> str:
+    """Turn [1] [2] etc. into small clickable-looking blue badges."""
+    def repl(m):
+        n = m.group(1)
+        return (
+            f" <a href='#source-{n}' style='text-decoration:none;color:#0078D4;"
+            f"font-size:0.85em;background-color:#E7F1FB;padding:1px 6px;"
+            f"border-radius:4px;border:1px solid #c8e0f4;font-weight:600;'>{n}</a> "
+        )
+    return CITATION_PATTERN.sub(repl, text)
+
+
 def render_response_with_widgets(container, text: str, streaming: bool = False):
     """
-    Splits `text` into prose and ```json:widget blocks.
-    Prose is written to `container` (supports markdown + source badges).
-    Each widget block is rendered as a Plotly chart beneath the prose.
-    
-    When streaming=True a cursor ▌ is appended to the prose preview and
-    widgets are NOT rendered yet (incomplete JSON mid-stream is skipped).
+    Splits `text` into:
+      - prose (with citation numbers styled as badges)
+      - ```json:widget``` blocks (rendered as Plotly charts)
+      - ```json:suggestions``` block (returned for separate rendering)
+
+    Returns: list of suggestion strings (empty if none found).
     """
-    # Apply source badge styling to prose
-    def _badge(t):
-        return re.sub(
-            r"\[Source:\s*(.*?)\]",
-            r" <span title='Reference data available below' style='color:#0078D4;"
-            r"font-size:0.85em;background-color:#F3F2F1;padding:2px 6px;"
-            r"border-radius:4px;cursor:help;border:1px solid #c8e0f4;'>🔍 \1</span> ",
-            t
-        )
+    # Extract suggestions FIRST so they don't leak into prose
+    suggestions = []
+    sug_match = SUGGESTIONS_PATTERN.search(text)
+    if sug_match and not streaming:
+        try:
+            sug_data = json.loads(sug_match.group(1))
+            suggestions = sug_data.get("suggestions", []) or []
+        except json.JSONDecodeError:
+            pass
+    # Strip the suggestions block from displayed text either way
+    text_no_sug = SUGGESTIONS_PATTERN.sub("", text)
 
     # Split on widget blocks
-    parts    = WIDGET_PATTERN.split(text)   # [prose, json, prose, json, ...]
-    prose_parts = parts[0::2]               # even indices → text
-    json_parts  = parts[1::2]               # odd  indices → raw JSON strings
+    parts = WIDGET_PATTERN.split(text_no_sug)
+    prose_parts = parts[0::2]
+    json_parts  = parts[1::2]
 
-    # Combine all prose for the main placeholder
     full_prose = "".join(prose_parts).strip()
     cursor     = " ▌" if streaming else ""
     if full_prose or streaming:
-        container.markdown(_badge(full_prose) + cursor, unsafe_allow_html=True)
+        styled = _style_citations(full_prose)
+        container.markdown(styled + cursor, unsafe_allow_html=True)
 
-    # Render widgets (only when not streaming — JSON may be incomplete mid-stream)
     if not streaming:
         for raw_json in json_parts:
             try:
@@ -123,6 +136,29 @@ def render_response_with_widgets(container, text: str, streaming: bool = False):
                 _render_single_widget(spec)
             except json.JSONDecodeError:
                 st.warning("Could not parse widget JSON — skipping.")
+
+    return suggestions
+
+
+def render_sources_panel(sources: list):
+    """Render the numbered sources list below an AI response.
+
+    sources is a list of dicts: [{"sequence": 1, "source": "PortfolioData",
+                                  "tool": "execute_sql", "content": "..."}]
+    """
+    if not sources:
+        return
+    with st.expander(f"📎 Sources ({len(sources)})", expanded=False):
+        for src in sources:
+            n     = src.get("sequence", "?")
+            label = src.get("source", "data")
+            tool  = src.get("tool", "")
+            body  = src.get("content", "")
+            st.markdown(f"**[{n}] {label}** · `{tool}`")
+            st.code(body[:4000], language="text")
+            if len(body) > 4000:
+                st.caption(f"…showing first 4000 of {len(body)} chars")
+            st.divider()
 
 
 # --- CONFIGURATION ---
@@ -413,7 +449,6 @@ elif page == "Execution Chat":
 
     workflows = fetch_data("workflows")
     if workflows:
-        # 🆕 Prepend an "Auto-route" pseudo-option to the real workflows list.
         AUTO_OPTION = {"id": "__auto__", "name": "🤖 Auto-route (Router decides)"}
         wf_options = [AUTO_OPTION] + list(workflows)
 
@@ -428,14 +463,13 @@ elif page == "Execution Chat":
             value="thread-test-1",
         )
 
-        # 🆕 Optional identity fields — wire to real auth later.
         col3, col4 = st.columns([1, 1])
         user_id = col3.text_input("User ID (optional)", value="")
         tenant_id = col4.text_input("Tenant ID", value="default")
 
         st.divider()
 
-        # Load History (unchanged)
+        # Load History
         if session_id:
             history = fetch_data(f"sessions/{session_id}/history")
             if history and history.get("messages"):
@@ -446,14 +480,26 @@ elif page == "Execution Chat":
                         else:
                             st.write(msg["content"])
 
-        # Chat Input
-        if prompt := st.chat_input("Send a message to the workflow..."):
+        # ─────────────────────────────────────────────────────────────────────
+        # Suggestion-click handler: if a previous suggestion was clicked,
+        # treat it as the next prompt. Stored in session_state.
+        # ─────────────────────────────────────────────────────────────────────
+        prompt = None
+        if "pending_suggestion" in st.session_state and st.session_state.pending_suggestion:
+            prompt = st.session_state.pending_suggestion
+            st.session_state.pending_suggestion = None  # consume it
+
+        # Normal chat input
+        chat_input_value = st.chat_input("Send a message to the workflow...")
+        if chat_input_value:
+            prompt = chat_input_value
+
+        if prompt:
             with st.chat_message("user"):
                 st.write(prompt)
 
             is_auto = selected_wf["id"] == "__auto__"
 
-            # 1. Build the payload exactly as before
             payload = {
                 "prompt": prompt,
                 "session_id": session_id if session_id else None,
@@ -465,77 +511,94 @@ elif page == "Execution Chat":
             if tenant_id.strip():
                 payload["tenant_id"] = tenant_id.strip()
 
-            # 2. Replace st.spinner with the new Streaming UI block
             with st.chat_message("ai"):
-                # Placeholders for the live UI updates
-                status_text = st.empty()       
-                message_placeholder = st.empty() 
-                
+                status_text       = st.empty()
+                message_placeholder = st.empty()
+                sources_container = st.container()
+                suggestions_container = st.container()
+
                 full_response = ""
                 execution_trace = []
+                collected_sources = []  # list of dicts from tool_result events
+                suggestions = []
 
                 try:
-                    # 3. Call the API with stream=True
-                    # Note: Adjust the base URL if your FastAPI is hosted on a different port/IP
                     response = requests.post(
                         "http://127.0.0.1:8000/api/chat",
                         json=payload,
-                        stream=True 
+                        stream=True,
                     )
-
                     response.raise_for_status()
 
-                    # 4. Iterate over the incoming Server-Sent Events (SSE)
                     for line in response.iter_lines():
-                        if line:
-                            decoded_line = line.decode('utf-8')
-                            
-                            if decoded_line.startswith("data: "):
-                                event_data = json.loads(decoded_line[6:])
-                                event_type = event_data.get("type")
-                                
-                                # Handle Real-time Status Updates (Tools, Routing decisions)
-                                if event_type == "status":
-                                    status_text.caption(f"🔄 {event_data.get('message')}")
-                                
-                                ### Change : Pertaining to citations and graphs
-                                    
-                                # # Handle Token Streaming (Typing effect)
-                                # elif event_type == "token":
-                                #     full_response += event_data.get("chunk", "")
-                                #     message_placeholder.markdown(full_response + " ▌")
-                                
-                                
+                        if not line:
+                            continue
+                        decoded_line = line.decode("utf-8")
+                        if not decoded_line.startswith("data: "):
+                            continue
 
-                                elif event_type == "token":
-                                    full_response += event_data.get("chunk", "")
-                                    # Stream prose only; skip widget rendering mid-stream
-                                    render_response_with_widgets(message_placeholder, full_response, streaming=True)
-                                    
-                                elif event_type == "complete":
-                                    # 🛠️ FIX: Fallback to the backend's final_answer if the stream dropped
-                                    final_text = event_data.get("final_answer") or full_response
-                                    # Render prose + all widgets now that the full response is available
-                                    render_response_with_widgets(message_placeholder, final_text, streaming=False)
-                                    status_text.empty()
-                                    execution_trace = event_data.get("trace", [])
-                                    
-                                # 🛠️ NEW: Catch backend errors so the UI tells you what went wrong!
-                                elif event_type == "error":
-                                    st.error(f"Backend Error: {event_data.get('message')}")
-                                    status_text.empty()
+                        try:
+                            event_data = json.loads(decoded_line[6:])
+                        except json.JSONDecodeError:
+                            continue
+                        event_type = event_data.get("type")
 
-                                    
-                                # # Handle Completion
-                                # elif event_type == "complete":
-                                #     message_placeholder.markdown(full_response)
-                                #     status_text.empty() # Remove the loading text
-                                #     execution_trace = event_data.get("trace", [])
+                        # ── Ephemeral status updates ──────────────────────────
+                        if event_type == "status":
+                            status_text.caption(f"🔄 {event_data.get('message', '')}")
 
-                                ## Change : End
-                                
+                        elif event_type == "node_enter":
+                            status_text.caption(f"🟢 {event_data.get('message', '')}")
 
-                    # 5. Show the Execution Trace in an expander after the stream finishes
+                        elif event_type == "tool_call":
+                            status_text.caption(f"🛠️  {event_data.get('message', '')}")
+
+                        # ── Capture structured tool result for the sources panel
+                        elif event_type == "tool_result":
+                            collected_sources.append({
+                                "sequence": event_data.get("sequence"),
+                                "source": event_data.get("source", ""),
+                                "tool": event_data.get("tool", ""),
+                                "content": event_data.get("content", ""),
+                            })
+
+                        # ── Token streaming from synthesizer ──────────────────
+                        elif event_type == "token":
+                            full_response += event_data.get("chunk", "")
+                            render_response_with_widgets(
+                                message_placeholder, full_response, streaming=True
+                            )
+
+                        # ── Final answer ──────────────────────────────────────
+                        elif event_type == "complete":
+                            final_text = event_data.get("final_answer") or full_response
+                            suggestions = render_response_with_widgets(
+                                message_placeholder, final_text, streaming=False
+                            )
+                            status_text.empty()
+                            execution_trace = event_data.get("trace", [])
+
+                        elif event_type == "error":
+                            st.error(f"Backend Error: {event_data.get('message')}")
+                            status_text.empty()
+
+                    # ── After stream closes: render sources & suggestions ────
+                    if collected_sources:
+                        with sources_container:
+                            render_sources_panel(collected_sources)
+
+                    if suggestions:
+                        with suggestions_container:
+                            st.markdown("**💡 Suggested follow-ups:**")
+                            sug_cols = st.columns(min(len(suggestions), 3))
+                            for i, sug in enumerate(suggestions[:3]):
+                                with sug_cols[i]:
+                                    # A unique key per (session, turn, index) avoids reruns clobbering
+                                    btn_key = f"sug_{session_id}_{len(history.get('messages', []) if history else [])}_{i}"
+                                    if st.button(sug, key=btn_key, use_container_width=True):
+                                        st.session_state.pending_suggestion = sug
+                                        st.rerun()
+
                     if execution_trace:
                         with st.expander("🔍 Graph Trace / Router Plan"):
                             st.markdown("**Execution Trace**")

@@ -246,16 +246,43 @@ CRITICAL RULES:
 """
 
     GLOBAL_TRUST_RULE = """
-    CRITICAL RULE - CITATIONS:
-    Whenever you state a specific fact, metric, date, or detail retrieved by a worker agent, you MUST cite the source inline. 
-    Format your citations strictly like this: [Source: TableName] or [Source: DocumentName].
-    Example: "Jonathan has an AUM of $47.10M [Source: PortfolioData]."
-    Never invent a source. If you don't know where the data came from, do not add a citation.
-    """
-    # active_synthesizer_persona += "\n" + GLOBAL_TRUST_RULE
+CITATION RULE:
+Cite tool data using numbered citations like [1], [2], [3].
+Numbers MUST match the order in which sources appeared in the conversation
+(the first tool result is [1], the second is [2], etc.).
+Example: "Jonathan has an AUM of $47.10M [1]."
+Only cite when stating a specific fact, metric, or detail retrieved from tool data.
+Never invent a citation number.
+"""
 
-    # Append BOTH rules
-    active_synthesizer_persona += "\n" + UNIVERSAL_WIDGET_RULE + "\n" + GLOBAL_TRUST_RULE
+    SUGGESTIONS_RULE = r"""
+FOLLOW-UP SUGGESTIONS:
+At the END of every response, append exactly one fenced block with three short
+follow-up question suggestions the user might ask next. Use this exact format:
+
+```json:suggestions
+{
+  "suggestions": [
+    "First suggested follow-up question",
+    "Second suggested follow-up question",
+    "Third suggested follow-up question"
+  ]
+}
+```
+
+Rules:
+- Always include this block, even for short answers.
+- Each suggestion should be a complete, natural question (5-12 words).
+- Suggestions must be relevant to the user's latest question and the data shown.
+- Do NOT number them. Do NOT add commentary around the block.
+"""
+
+    # Append all three rules
+    active_synthesizer_persona += (
+        "\n" + UNIVERSAL_WIDGET_RULE
+        + "\n" + GLOBAL_TRUST_RULE
+        + "\n" + SUGGESTIONS_RULE
+    )
 
     # 👈 Fixed: Define agent_descriptions BEFORE using it
     agent_descriptions = "\n".join([f"- {agent.id}: {agent.routing_description}" for agent in agents])

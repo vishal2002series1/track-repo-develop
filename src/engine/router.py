@@ -380,40 +380,174 @@ def execute_plan(
 
 ##. Change SSE 2 Start: Streaming version of the executor -------------------------------------------------------------
 # --- 5. Streaming Executor (SSE) ---------------------------------------------
+
+# Tools that produce structured "source" data we want to surface to the UI
+# (anything else just emits a generic status update).
+_SOURCE_CAPTURE_TOOLS = {
+    "execute_sql", "get_database_schema",
+    "search_transcripts", "search_client_emails",
+    "compute_portfolio_metrics", "compute_portfolio_return",
+    "analyze_advisor_book", "compute_portfolio_concentration",
+}
+
+
+def _short_tool_label(tool_name: str, tool_input: dict) -> str:
+    """Human-friendly label for a tool call shown in ephemeral status events."""
+    if tool_name == "execute_sql":
+        q = (tool_input or {}).get("query", "")
+        # Extract the FROM table for a concise hint
+        import re as _re
+        m = _re.search(r'FROM\s+"?(\w+)"?', q, _re.IGNORECASE)
+        table = m.group(1) if m else "database"
+        return f"Querying {table}"
+    if tool_name == "get_database_schema":
+        tables = (tool_input or {}).get("table_names") or []
+        if tables:
+            return f"Inspecting schema: {', '.join(tables[:3])}"
+        return "Loading database schema"
+    if tool_name == "search_transcripts":
+        return "Searching transcripts"
+    if tool_name == "search_client_emails":
+        return "Searching client emails"
+    if tool_name.startswith("compute_"):
+        return f"Computing {tool_name.replace('compute_', '').replace('_', ' ')}"
+    if tool_name == "analyze_advisor_book":
+        return "Analyzing advisor book"
+    return f"Running {tool_name}"
+
+
+def _short_node_label(node_name: str) -> str:
+    """Friendly label for a node activation."""
+    if node_name == "supervisor":
+        return "Planning next step"
+    if node_name == "synthesizer":
+        return "Composing final answer"
+    # agent ids look like `portfolio_domain_agent` etc.
+    pretty = node_name.replace("_domain_agent", "").replace("_", " ").title()
+    return f"{pretty} agent working"
+
+
+def _truncate_source_content(content: str, max_chars: int = 8000) -> str:
+    """Cap source payload size so SSE frames stay sane."""
+    if content is None:
+        return ""
+    s = str(content)
+    return s if len(s) <= max_chars else s[:max_chars] + f"\n\n... [truncated, {len(s) - max_chars} more chars]"
+
+
 def _run_one_step_stream(
     workflow_id: str,
     composed_prompt: str,
     session_id: str,
     event_queue: queue.Queue
 ) -> None:
-    """Runs a workflow and pushes real-time events to the queue."""
+    """Runs a workflow and pushes real-time events to the queue.
+
+    Events emitted (per turn):
+      - status        ephemeral progress message
+      - node_enter    {node} when a graph node starts
+      - tool_call     {tool, input_summary}  before a tool runs
+      - tool_result   {tool, source, content, sequence}  after a tool returns
+      - token         streaming token from synthesizer LLM
+      - step_complete final answer + trace for this workflow step
+      - error         exception detail
+    """
     db = SessionLocal()
     try:
         graph = build_dynamic_graph(workflow_id, db)
-        thread_id = f"{session_id}::{workflow_id}::{int(time.time())}" ## Change for better traceability in concurrent runs
+        thread_id = f"{session_id}::{workflow_id}::{int(time.time())}"
         config = {"configurable": {"thread_id": thread_id}}
         inputs = {"messages": [HumanMessage(content=composed_prompt)]}
 
         trace = []
         final_answer = ""
-        
-        event_queue.put({"type": "status", "message": f"Initializing {workflow_id}..."})
+        source_sequence = 0  # incrementing id used by UI to link badges → sources
 
-        # stream_mode="messages" allows us to catch token-by-token LLM output
+        event_queue.put({"type": "status", "message": f"Starting {workflow_id}…"})
+
+        # ─────────────────────────────────────────────────────────────────────
+        # We stream in TWO modes interleaved via the same generator:
+        #   - "messages" gives us individual messages (tool calls, tool results,
+        #     and token-level synthesizer chunks).
+        #   - We track which node each message belongs to via metadata.
+        # LangGraph emits one tuple per message; we classify it ourselves.
+        # ─────────────────────────────────────────────────────────────────────
+        seen_nodes = set()
+
         for event in graph.stream(inputs, config=config, stream_mode="messages"):
             msg, metadata = event
-            
-            # If it's a token streaming from the AI
-            if msg.content and metadata.get("langgraph_node") == "synthesizer":
-                event_queue.put({"type": "token", "chunk": msg.content})
-                final_answer += msg.content
-                
-            # If it's a tool call or intermediate agent routing
-            elif metadata.get("langgraph_node") != "synthesizer" and msg.name:
-                 event_queue.put({"type": "status", "message": f"Running tool: {msg.name}..."})
-                 trace.append(f"{workflow_id}:{msg.name}")
+            node = metadata.get("langgraph_node", "")
 
-        event_queue.put({"type": "step_complete", "workflow_id": workflow_id, "answer": final_answer, "trace": trace})
+            # 1) Node-enter events (first time we see a message from a node)
+            if node and node not in seen_nodes:
+                seen_nodes.add(node)
+                event_queue.put({
+                    "type": "node_enter",
+                    "node": node,
+                    "message": _short_node_label(node),
+                })
+                trace.append(f"{workflow_id}:{node}")
+
+            msg_type = getattr(msg, "type", None)
+
+            # 2) Synthesizer token stream
+            if node == "synthesizer" and msg_type == "AIMessageChunk":
+                if getattr(msg, "content", None):
+                    event_queue.put({"type": "token", "chunk": msg.content})
+                    final_answer += msg.content
+                continue
+
+            # 3) Tool call detected on an AI message (worker agent dispatched a tool)
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            if tool_calls:
+                for tc in tool_calls:
+                    tool_name = tc.get("name") or "unknown_tool"
+                    tool_args = tc.get("args") or {}
+                    event_queue.put({
+                        "type": "tool_call",
+                        "tool": tool_name,
+                        "node": node,
+                        "message": _short_tool_label(tool_name, tool_args),
+                    })
+                continue
+
+            # 4) Tool result (ToolMessage emitted after tool execution)
+            if msg_type == "tool":
+                tool_name = getattr(msg, "name", "unknown_tool") or "unknown_tool"
+                content = _truncate_source_content(getattr(msg, "content", ""))
+
+                # Always emit a status nudge for visibility
+                event_queue.put({
+                    "type": "status",
+                    "message": f"{_short_tool_label(tool_name, {})} — done",
+                })
+
+                # Emit a structured source payload for the UI to render as a citation
+                if tool_name in _SOURCE_CAPTURE_TOOLS:
+                    source_sequence += 1
+                    # Source "label" defaults to the table name for SQL, else tool name
+                    source_label = tool_name
+                    if tool_name == "execute_sql":
+                        import re as _re
+                        m = _re.search(r'FROM\s+"?(\w+)"?', content[:500], _re.IGNORECASE)
+                        if m:
+                            source_label = m.group(1)
+                    event_queue.put({
+                        "type": "tool_result",
+                        "sequence": source_sequence,
+                        "tool": tool_name,
+                        "source": source_label,
+                        "content": content,
+                        "node": node,
+                    })
+                continue
+
+        event_queue.put({
+            "type": "step_complete",
+            "workflow_id": workflow_id,
+            "answer": final_answer,
+            "trace": trace,
+        })
     except Exception as e:
         event_queue.put({"type": "error", "message": str(e)})
     finally:
