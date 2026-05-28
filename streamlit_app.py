@@ -21,6 +21,33 @@ SUGGESTIONS_PATTERN = re.compile(r"```json:suggestions\s*(\{.*?\})\s*```", re.DO
 CITATION_PATTERN = re.compile(r"\[(\d+)\]")
 
 
+def extract_raw_json_objects(text: str):
+    """
+    Extract top-level JSON objects from mixed text.
+    Returns list of tuples: (start_index, end_index, parsed_dict)
+    """
+    results = []
+    decoder = json.JSONDecoder()
+    i = 0
+
+    while i < len(text):
+        if text[i] != "{":
+            i += 1
+            continue
+
+        try:
+            obj, end = decoder.raw_decode(text[i:])
+            if isinstance(obj, dict):
+                results.append((i, i + end, obj))
+                i = i + end
+            else:
+                i += 1
+        except json.JSONDecodeError:
+            i += 1
+
+    return results
+
+
 def _render_single_widget(spec: dict):
     """Render one widget spec dict as a Streamlit Plotly chart."""
     chart_type = spec.get("chart_type", "").lower()
@@ -99,43 +126,111 @@ def _style_citations(text: str) -> str:
 
 def render_response_with_widgets(container, text: str, streaming: bool = False):
     """
-    Splits `text` into:
-      - prose (with citation numbers styled as badges)
-      - ```json:widget``` blocks (rendered as Plotly charts)
-      - ```json:suggestions``` block (returned for separate rendering)
+    Renders:
+      - prose
+      - ```json:widget``` chart blocks
+      - ```json:suggestions``` blocks
+      - normal ```json``` chart/suggestion blocks
+      - raw JSON chart/suggestion objects
 
-    Returns: list of suggestion strings (empty if none found).
+    Returns: list of suggestion strings.
     """
-    # Extract suggestions FIRST so they don't leak into prose
+
     suggestions = []
-    sug_match = SUGGESTIONS_PATTERN.search(text)
-    if sug_match and not streaming:
+    widgets = []
+    spans_to_remove = []
+
+    # Avoid parsing incomplete JSON during streaming
+    if streaming:
+        styled = _style_citations(text)
+        container.markdown(styled + " ▌", unsafe_allow_html=True)
+        return []
+
+    # 1. Parse fenced json:suggestions blocks
+    for match in SUGGESTIONS_PATTERN.finditer(text):
+        raw_json = match.group(1)
         try:
-            sug_data = json.loads(sug_match.group(1))
-            suggestions = sug_data.get("suggestions", []) or []
+            obj = json.loads(raw_json)
+            if isinstance(obj, dict) and "suggestions" in obj:
+                suggestions = obj.get("suggestions", []) or suggestions
+                spans_to_remove.append(match.span())
         except json.JSONDecodeError:
             pass
-    # Strip the suggestions block from displayed text either way
-    text_no_sug = SUGGESTIONS_PATTERN.sub("", text)
 
-    # Split on widget blocks
-    parts = WIDGET_PATTERN.split(text_no_sug)
-    prose_parts = parts[0::2]
-    json_parts  = parts[1::2]
+    # 2. Parse fenced json:widget blocks
+    for match in WIDGET_PATTERN.finditer(text):
+        raw_json = match.group(1)
+        try:
+            obj = json.loads(raw_json)
+            if isinstance(obj, dict) and "chart_type" in obj:
+                widgets.append(obj)
+                spans_to_remove.append(match.span())
+        except json.JSONDecodeError:
+            pass
 
-    full_prose = "".join(prose_parts).strip()
-    cursor     = " ▌" if streaming else ""
-    if full_prose or streaming:
+    # 3. Parse normal fenced ```json blocks
+    for match in GENERIC_JSON_BLOCK_PATTERN.finditer(text):
+        raw_json = match.group(1)
+        try:
+            obj = json.loads(raw_json)
+
+            if isinstance(obj, dict) and "chart_type" in obj:
+                widgets.append(obj)
+                spans_to_remove.append(match.span())
+
+            elif isinstance(obj, dict) and "suggestions" in obj:
+                suggestions = obj.get("suggestions", []) or suggestions
+                spans_to_remove.append(match.span())
+
+        except json.JSONDecodeError:
+            pass
+
+    # 4. Remove fenced blocks before raw JSON parsing
+    cleaned_for_raw = text
+
+    if spans_to_remove:
+        pieces = []
+        last = 0
+        for start, end in sorted(spans_to_remove):
+            pieces.append(text[last:start])
+            last = end
+        pieces.append(text[last:])
+        cleaned_for_raw = "".join(pieces)
+
+    # 5. Parse remaining raw JSON objects
+    raw_spans_to_remove = []
+
+    for start, end, obj in extract_raw_json_objects(cleaned_for_raw):
+        if "chart_type" in obj:
+            widgets.append(obj)
+            raw_spans_to_remove.append((start, end))
+
+        elif "suggestions" in obj:
+            suggestions = obj.get("suggestions", []) or suggestions
+            raw_spans_to_remove.append((start, end))
+
+    # 6. Remove raw JSON objects from prose
+    final_text = cleaned_for_raw
+
+    if raw_spans_to_remove:
+        pieces = []
+        last = 0
+        for start, end in sorted(raw_spans_to_remove):
+            pieces.append(cleaned_for_raw[last:start])
+            last = end
+        pieces.append(cleaned_for_raw[last:])
+        final_text = "".join(pieces)
+
+    # 7. Render prose
+    full_prose = final_text.strip()
+
+    if full_prose:
         styled = _style_citations(full_prose)
-        container.markdown(styled + cursor, unsafe_allow_html=True)
+        container.markdown(styled, unsafe_allow_html=True)
 
-    if not streaming:
-        for raw_json in json_parts:
-            try:
-                spec = json.loads(raw_json)
-                _render_single_widget(spec)
-            except json.JSONDecodeError:
-                st.warning("Could not parse widget JSON — skipping.")
+    # 8. Render widgets
+    for spec in widgets:
+        _render_single_widget(spec)
 
     return suggestions
 

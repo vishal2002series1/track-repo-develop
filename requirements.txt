@@ -29,3 +29,4 @@ langchain
 arize-otel
 opentelemetry-sdk
 opentelemetry-exporter-otlp
+plotly

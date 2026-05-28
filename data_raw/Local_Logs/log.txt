@@ -1,40 +1,103 @@
-(venv) PS C:\Users\XP343UZ\OneDrive - EY\Desktop\Project\AI-AGENT-FACTORY> python src/scripts/batch_autofabricator.py
-Initializing fresh Agent Registry JSON with default AEON agents...
-🚀 Starting Bounded Domain Fabrication...
+Yes, I understand. And honestly, my recommendation is to give a designer (or you in PowerPoint) a tight brief rather than
+  have me regenerate the .pptx via script — the current draft has 63 carefully-styled shapes and a script-generated
+  replacement would look "auto-generated" next to it. Better to keep the visual style and rework the content.
 
-📦 Analyzing Domain: Portfolio & Performance Analysis
-📌 Mandatory Agents: ['client_profile_domain_agent']
-🔍 Found 11 existing agents in global registry.
-Traceback (most recent call last):
-  File "C:\Users\XP343UZ\OneDrive - EY\Desktop\Project\AI-AGENT-FACTORY\src\scripts\batch_autofabricator.py", line 75, in <module>
-    run_domain_fabrication(target_file)
-    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
-  File "C:\Users\XP343UZ\OneDrive - EY\Desktop\Project\AI-AGENT-FACTORY\src\scripts\batch_autofabricator.py", line 41, in run_domain_fabrication
-    fabricator = DomainFabricator()
-  File "C:\Users\XP343UZ\OneDrive - EY\Desktop\Project\AI-AGENT-FACTORY\src\agents\fabricator.py", line 33, in __init__
-    self.llm = AzureChatOpenAI(
-               ~~~~~~~~~~~~~~~^
-        api_key=api_key,
-        ^^^^^^^^^^^^^^^^
-    ...<4 lines>...
-        max_tokens=8000
-        ^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\XP343UZ\OneDrive - EY\Desktop\Project\AI-AGENT-FACTORY\venv\Lib\site-packages\langchain_core\load\serializable.py", line 118, in __init__
-    super().__init__(*args, **kwargs)
-    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
-  File "C:\Users\XP343UZ\OneDrive - EY\Desktop\Project\AI-AGENT-FACTORY\venv\Lib\site-packages\pydantic\main.py", line 263, in __init__
-    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
-  File "C:\Users\XP343UZ\OneDrive - EY\Desktop\Project\AI-AGENT-FACTORY\venv\Lib\site-packages\langchain_openai\chat_models\azure.py", line 690, in validate_environment
-    self.root_client = openai.AzureOpenAI(**client_params, **sync_specific)  # type: ignore[arg-type]
-                       ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\XP343UZ\OneDrive - EY\Desktop\Project\AI-AGENT-FACTORY\venv\Lib\site-packages\openai\lib\azure.py", line 202, in __init__
-    raise OpenAIError(
-        "Missing credentials. Please pass one of `api_key`, `azure_ad_token`, `azure_ad_token_provider`, or the `AZURE_OPENAI_API_KEY` or `AZURE_OPENAI_AD_TOKEN` environment variables."
-    )
-openai.OpenAIError: Missing credentials. Please pass one of `api_key`, `azure_ad_token`, `azure_ad_token_provider`, or the `AZURE_OPENAI_API_KEY` or `AZURE_OPENAI_AD_TOKEN` environment variables.
-(venv) PS C:\Users\XP343UZ\OneDrive - EY\Desktop\Project\AI-AGENT-FACTORY> python seed_db.py
+  Here's the brief, tight enough to hand off as-is.
 
+  ---
+  Redesigned architecture — single slide
 
-wfsdfg
+  Top-line title
+
+  Aeon Wealth — Multi-Agent Platform on Azure Container Apps
+
+  What to remove from the current diagram
+
+  - "Streamlit" → replace with Frontend (Advisor UI) (generic)
+  - "Azure Webapp / App Service" / "Deployment" → replace with Azure Container Apps as the hosting band running across the
+  top edge
+  - "Vector DB" as a separate cylinder → fold into the Postgres box (it's pgvector inside the same database, not a separate
+  store)
+  - "4 workflows", "8 specialized agents", "9 domain agents" → drop the specific counts; show 2-3 illustrative names instead
+  (e.g. "Portfolio Analytics", "Compliance Review", "Meeting Prep")
+  - Bottom row "Router → Planner → Supervisor → Agent Factory" → this conflates two separate things; remove and replace with
+  the orchestration band described below
+  - Any mention of "Docker" anywhere
+
+  New layout — five horizontal bands
+
+  Band 1: Client Layer
+  - One box: Frontend (Advisor UI) — persona-based login
+  - Note: "On Azure Container Apps"
+  - Optional: a faint dashed box to the right labeled "Future: External A2A consumers" (for the marketplace story)
+
+  Band 2: API Layer
+  - One wide box: FastAPI with sub-pills inside:
+    - Chat & Streaming (SSE)
+    - Agent CRUD
+    - Workflow CRUD
+    - A2A Card endpoint — callout this one: "Each agent exposes a structured card → marketplace-ready"
+
+  Band 3: Orchestration Layer (center, the largest band)
+  - Left: Router ("plans which workflow to run")
+  - Center: LangGraph Workflow Engine, with three illustrative workflow chips inside (Portfolio Analytics, Compliance Review,
+   Meeting Prep) and the note "Built dynamically per request"
+  - Inside the workflow box, show three sub-nodes: Supervisor → Worker Agents → Synthesizer with arrows
+  - Right side of this band, two boxes the workflow connects out to:
+    - MCP Server (SSE transport, tools: SQL, semantic search, pure-math)
+    - Azure OpenAI (reasoning + embeddings)
+
+  Band 4: Capability Highlights — show as 4 distinct boxes ⭐ (these are your strategic differentiators — visually elevated
+  with a star, color, or border)
+
+  ┌─────┬───────────────┬────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ ⭐  │      Box      │                                            Sub-text                                            │
+  ├─────┼───────────────┼────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ⭐  │ Agent Factory │ Specialized agents reusable across workflows; built-in Prompt Versioning for personas,         │
+  │     │               │ supervisor rules, and synthesizer voice                                                        │
+  ├─────┼───────────────┼────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ⭐  │ Workflow      │ Test-driven workflow creation; auto-architects required agents from golden test cases;         │
+  │     │ Builder       │ human-in-the-loop approval                                                                     │
+  ├─────┼───────────────┼────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ⭐  │ A2A           │ Every agent has a structured A2A card auto-generated on save; agents can be discovered &       │
+  │     │ Enablement    │ invoked by external agent platforms → Agent Marketplace                                        │
+  ├─────┼───────────────┼────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ ⭐  │ Memory Layer  │ Two complementary stores: Episodic Memory (pgvector, cross-session personalization) +          │
+  │     │               │ Checkpoint Memory (LangGraph per-conversation state, turn-by-turn replay)                      │
+  └─────┴───────────────┴────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Band 5: Data Layer
+  - One box: Azure PostgreSQL containing four schema chips:
+    - Business data (clients, holdings, communications)
+    - Agents (agent definitions, A2A cards, prompt versions)
+    - Checkpoints (LangGraph per-thread state)
+    - Episodes (pgvector — semantic memory)
+
+  Right rail (cross-cutting, spans all bands)
+
+  - Observability Platform — "OpenTelemetry → Arize-integrated"
+  - One vertical block on the right edge
+
+  Future-state callout (bottom or top-right corner, dashed)
+
+  "Agent Marketplace — agents published via A2A cards can be discovered, evaluated, and invoked by partner systems"
+
+  Arrow rules (for whoever lays it out)
+
+  - Frontend → API → Router → LangGraph (left to right or top to bottom)
+  - LangGraph ↔ MCP Server (request/response, two-way arrow)
+  - LangGraph ↔ Azure OpenAI (two-way)
+  - LangGraph ↔ Memory Layer (two-way; show both Episodic and Checkpoint reads/writes)
+  - MCP Server ↔ Postgres business schemas
+  - API ↔ Agent Factory (CRUD)
+  - Workflow Builder → Agent Factory + LangGraph (deploy)
+
+  Visual treatment
+
+  - Keep the existing dark/yellow theme — it's distinctive
+  - The four ⭐ capability boxes should be visually emphasized (lighter background, gold border, or a "key feature" tag)
+  - Counts removed everywhere — replace with "Multiple specialized agents", "Multiple workflows", "Suite of tools"
+  - Add a small Azure Container Apps band/badge across the top of the orchestration + API + frontend layers showing they all
+  share the same hosting
+
+  ---
